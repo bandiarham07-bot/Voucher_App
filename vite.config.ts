@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
-const REPO_BASE = '/Designreceiptgenerationapp/'
+const REPO_BASE = '/Voucher_App/'
 
 function figmaAssetResolver() {
   return {
