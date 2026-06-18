@@ -1,4 +1,5 @@
 import { jsPDF } from "jspdf";
+import html2canvas from "html2canvas";
 
 export interface VoucherPDFEntry {
   direction: "paid" | "received";
@@ -11,8 +12,6 @@ export interface VoucherPDFEntry {
 
 const TRUST_NAME = "श्री श्वेतांबर जैन तपागच्छ उपाश्रय ट्रस्ट";
 const TRUST_ADDRESS = "4/2 रेस कोर्स रोड, इंदौर";
-
-let fontDataPromise: Promise<string | null> | null = null;
 
 function formatINR(value: number): string {
   return new Intl.NumberFormat("en-IN", {
@@ -32,101 +31,88 @@ function directionLabel(direction: VoucherPDFEntry["direction"]): string {
   return direction === "paid" ? "Paid to" : "Received from";
 }
 
-async function loadDevanagariFont(): Promise<string | null> {
-  if (!fontDataPromise) {
-    fontDataPromise = fetch(`${import.meta.env.BASE_URL}fonts/NotoSansDevanagari-Regular.ttf`)
-      .then((res) => {
-        if (!res.ok) throw new Error("Failed to load Devanagari font");
-        return res.arrayBuffer();
-      })
-      .then((buffer) => {
-        const bytes = new Uint8Array(buffer);
-        const chunkSize = 8192;
-        let binary = "";
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-        }
-        return btoa(binary);
-      })
-      .catch(() => null);
-  }
-  return fontDataPromise;
-}
-
-function addDivider(doc: jsPDF, y: number): number {
-  doc.setDrawColor(220, 220, 220);
-  doc.line(20, y, 190, y);
-  return y + 8;
-}
-
-function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean) {
-  const deva = fontLoaded ? "NotoSansDevanagari" : "helvetica";
-
-  doc.setFont(deva, "normal");
-  doc.setFontSize(16);
-  doc.text(TRUST_NAME, 20, 28);
-
-  doc.setFontSize(11);
-  doc.setTextColor(85, 85, 85);
-  doc.text(TRUST_ADDRESS, 20, 36);
-  doc.setTextColor(28, 28, 30);
-
-  let y = addDivider(doc, 44);
-
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(18);
-  doc.text("PAYMENT VOUCHER", 20, y + 6);
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(11);
-  doc.setTextColor(85, 85, 85);
-  doc.text(entry.voucherNo, 190, y + 6, { align: "right" });
-  doc.setTextColor(28, 28, 30);
-  y += 14;
-  doc.setFont("helvetica", "normal");
-  doc.text(`Date: ${formatDisplayDate(entry.date)}`, 20, y);
-
-  y = addDivider(doc, y + 6);
-
-  const rows: [string, string][] = [
+function buildVoucherHTML(entry: VoucherPDFEntry): string {
+  const rows = [
     [directionLabel(entry.direction), entry.vendor],
     ["Amount", `Rs. ${formatINR(entry.amount)}`],
     ["Account", entry.account],
   ];
 
-  doc.setFontSize(12);
-  for (const [label, value] of rows) {
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(85, 85, 85);
-    doc.text(label, 20, y);
-    doc.setTextColor(28, 28, 30);
-    doc.text(value, 190, y, { align: "right", maxWidth: 110 });
-    y += 10;
-    doc.setDrawColor(240, 240, 240);
-    doc.line(20, y - 4, 190, y - 4);
-  }
+  const rowsHTML = rows
+    .map(
+      ([label, value]) => `
+      <div style="display:flex;justify-content:space-between;align-items:baseline;padding:10px 0;border-bottom:1px solid #f0f0f0;">
+        <span style="color:#555;font-size:13px;">${label}</span>
+        <span style="color:#1c1c1e;font-size:13px;text-align:right;max-width:60%;">${value}</span>
+      </div>`
+    )
+    .join("");
 
-  y += 24;
-  doc.setDrawColor(28, 28, 30);
-  doc.line(110, y, 190, y);
-  doc.setFontSize(10);
-  doc.setTextColor(85, 85, 85);
-  doc.text("Authorised Signatory", 150, y + 8, { align: "center" });
+  return `
+    <div style="
+      width:794px;
+      min-height:400px;
+      padding:40px 56px;
+      font-family:'Noto Sans Devanagari','Noto Sans',Arial,sans-serif;
+      background:#fff;
+      box-sizing:border-box;
+      color:#1c1c1e;
+    ">
+      <div style="font-size:18px;font-weight:600;margin-bottom:4px;">${TRUST_NAME}</div>
+      <div style="font-size:13px;color:#555;margin-bottom:16px;">${TRUST_ADDRESS}</div>
+      <hr style="border:none;border-top:1px solid #dcdcdc;margin-bottom:16px;" />
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+        <span style="font-size:20px;font-weight:700;letter-spacing:0.5px;">PAYMENT VOUCHER</span>
+        <span style="font-size:12px;color:#555;">${entry.voucherNo}</span>
+      </div>
+      <div style="font-size:13px;color:#1c1c1e;margin-bottom:16px;">Date: ${formatDisplayDate(entry.date)}</div>
+      <hr style="border:none;border-top:1px solid #dcdcdc;margin-bottom:8px;" />
+      ${rowsHTML}
+      <div style="margin-top:48px;display:flex;justify-content:flex-end;">
+        <div style="text-align:center;min-width:160px;">
+          <div style="border-top:1px solid #1c1c1e;padding-top:8px;font-size:11px;color:#555;">Authorised Signatory</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function renderVoucherToCanvas(entry: VoucherPDFEntry): Promise<HTMLCanvasElement> {
+  const container = document.createElement("div");
+  container.style.position = "fixed";
+  container.style.left = "-9999px";
+  container.style.top = "0";
+  container.style.width = "794px";
+  container.innerHTML = buildVoucherHTML(entry);
+  document.body.appendChild(container);
+
+  await document.fonts.ready;
+
+  const canvas = await html2canvas(container, {
+    scale: 2,
+    useCORS: true,
+    backgroundColor: "#ffffff",
+    width: 794,
+  });
+
+  document.body.removeChild(container);
+  return canvas;
 }
 
 async function buildVoucherPDF(entries: VoucherPDFEntry[]): Promise<Blob> {
-  const fontBase64 = await loadDevanagariFont();
   const doc = new jsPDF({ unit: "mm", format: "a4" });
-  const fontLoaded = !!fontBase64;
+  const pageW = 210;
+  const pageH = 297;
 
-  if (fontBase64) {
-    doc.addFileToVFS("NotoSansDevanagari-Regular.ttf", fontBase64);
-    doc.addFont("NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari", "normal");
+  for (let i = 0; i < entries.length; i++) {
+    if (i > 0) doc.addPage();
+    const canvas = await renderVoucherToCanvas(entries[i]);
+    const imgData = canvas.toDataURL("image/png");
+    const canvasAspect = canvas.height / canvas.width;
+    const imgW = pageW;
+    const imgH = imgW * canvasAspect;
+    doc.addImage(imgData, "PNG", 0, 0, imgW, Math.min(imgH, pageH));
   }
-
-  entries.forEach((entry, index) => {
-    if (index > 0) doc.addPage();
-    drawVoucherPage(doc, entry, fontLoaded);
-  });
 
   return doc.output("blob");
 }
