@@ -12,7 +12,7 @@ export interface VoucherPDFEntry {
 const TRUST_NAME = "श्री श्वेतांबर जैन तपागच्छ उपाश्रय ट्रस्ट";
 const TRUST_ADDRESS = "4/2 रेस कोर्स रोड, इंदौर";
 
-let fontDataPromise: Promise<string> | null = null;
+let fontDataPromise: Promise<string | null> | null = null;
 
 function formatINR(value: number): string {
   return new Intl.NumberFormat("en-IN", {
@@ -32,7 +32,7 @@ function directionLabel(direction: VoucherPDFEntry["direction"]): string {
   return direction === "paid" ? "Paid to" : "Received from";
 }
 
-async function loadDevanagariFont(): Promise<string> {
+async function loadDevanagariFont(): Promise<string | null> {
   if (!fontDataPromise) {
     fontDataPromise = fetch(`${import.meta.env.BASE_URL}fonts/NotoSansDevanagari-Regular.ttf`)
       .then((res) => {
@@ -46,7 +46,8 @@ async function loadDevanagariFont(): Promise<string> {
           binary += String.fromCharCode(bytes[i]);
         }
         return btoa(binary);
-      });
+      })
+      .catch(() => null);
   }
   return fontDataPromise;
 }
@@ -80,6 +81,7 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
   doc.text(entry.voucherNo, 190, y + 6, { align: "right" });
   doc.setTextColor(28, 28, 30);
   y += 14;
+  doc.setFont(deva, "normal");
   doc.text(`Date: ${formatDisplayDate(entry.date)}`, 20, y);
 
   y = addDivider(doc, y + 6);
@@ -92,10 +94,10 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
 
   doc.setFontSize(12);
   for (const [label, value] of rows) {
+    doc.setFont(deva, "normal");
     doc.setTextColor(85, 85, 85);
     doc.text(label, 20, y);
     doc.setTextColor(28, 28, 30);
-    doc.setFont("helvetica", "normal");
     doc.text(value, 190, y, { align: "right", maxWidth: 110 });
     y += 10;
     doc.setDrawColor(240, 240, 240);
@@ -113,13 +115,16 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
 async function buildVoucherPDF(entries: VoucherPDFEntry[]): Promise<Blob> {
   const fontBase64 = await loadDevanagariFont();
   const doc = new jsPDF({ unit: "mm", format: "a4" });
+  const fontLoaded = !!fontBase64;
 
-  doc.addFileToVFS("NotoSansDevanagari-Regular.ttf", fontBase64);
-  doc.addFont("NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari", "normal");
+  if (fontBase64) {
+    doc.addFileToVFS("NotoSansDevanagari-Regular.ttf", fontBase64);
+    doc.addFont("NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari", "normal");
+  }
 
   entries.forEach((entry, index) => {
     if (index > 0) doc.addPage();
-    drawVoucherPage(doc, entry, true);
+    drawVoucherPage(doc, entry, fontLoaded);
   });
 
   return doc.output("blob");
