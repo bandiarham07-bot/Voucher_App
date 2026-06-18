@@ -1,19 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, ChevronDown } from "lucide-react";
+import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, ChevronDown, Settings as SettingsIcon } from "lucide-react";
 import { Toaster, toast } from "sonner";
-
-// ── Types ──────────────────────────────────────────────────────────────────
-
-interface ReceiptEntry {
-  id: number;
-  vendor: string;
-  amount: number;
-  account: string;
-  date: string;
-  receiptNo: string;
-}
-
-type Tab = "generate" | "master" | "history";
+import { initAppData, setItem } from "../lib/db";
+import { openVoucherPDF } from "../lib/pdf";
+import type { Direction, Tab, VoucherEntry } from "./types";
+import { DEFAULT_SPLIT_THRESHOLD } from "./types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -48,25 +39,47 @@ function formatDisplayDate(iso: string): string {
   return `${parseInt(d)} ${months[parseInt(m) - 1]} ${y}`;
 }
 
-function nextReceiptNo(history: ReceiptEntry[]): string {
-  const max = history.reduce((acc, r) => {
-    const n = parseInt(r.receiptNo.replace("RCP-", "")) || 0;
+function directionLabel(direction: Direction): string {
+  return direction === "paid" ? "Paid to" : "Received from";
+}
+
+function maxVoucherNum(history: VoucherEntry[]): number {
+  return history.reduce((acc, r) => {
+    const n = parseInt(r.voucherNo.replace("VCH-", "")) || 0;
     return Math.max(acc, n);
   }, 0);
-  return "RCP-" + String(max + 1).padStart(4, "0");
 }
 
-function loadLS<T>(key: string, fallback: T): T {
-  try {
-    const v = localStorage.getItem(key);
-    return v ? (JSON.parse(v) as T) : fallback;
-  } catch {
-    return fallback;
+function voucherNoFromNum(n: number): string {
+  return "VCH-" + String(n).padStart(4, "0");
+}
+
+// Splits an amount into the minimum number of whole-rupee parts, each
+// strictly under `threshold`. Any leftover paise is added entirely to the
+// last piece so the total still matches exactly. Returns [amount] unchanged
+// if it doesn't exceed the threshold.
+function computeSplit(amount: number, threshold: number): number[] {
+  if (amount <= threshold) return [amount];
+
+  const totalPaiseInt = Math.round(amount * 100);
+  const paise = totalPaiseInt % 100;
+  const rupees = (totalPaiseInt - paise) / 100;
+
+  const n = Math.ceil(rupees / (threshold - 1));
+  const base = Math.floor(rupees / n);
+  const remainder = rupees % n;
+
+  const parts: number[] = [];
+  for (let i = 0; i < n; i++) {
+    parts.push(base + (i < remainder ? 1 : 0));
   }
-}
 
-function saveLS(key: string, value: unknown) {
-  localStorage.setItem(key, JSON.stringify(value));
+  if (paise > 0) {
+    const lastIdx = parts.length - 1;
+    parts[lastIdx] = Math.round((parts[lastIdx] + paise / 100) * 100) / 100;
+  }
+
+  return parts;
 }
 
 function handleAmountInput(raw: string): string {
@@ -75,50 +88,6 @@ function handleAmountInput(raw: string): string {
   const intPart = parts[0];
   const decPart = parts.length > 1 ? parts[1] : null;
   return formatIndianInteger(intPart) + (decPart !== null ? "." + decPart : "");
-}
-
-// ── PDF (browser print) ────────────────────────────────────────────────────
-
-function openReceiptPDF(entry: ReceiptEntry) {
-  const amtFormatted = "₹ " + formatINR(entry.amount);
-  const dateFormatted = formatDisplayDate(entry.date);
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:'Inter',-apple-system,sans-serif;color:#1c1c1e;background:#fff;}
-.page{max-width:580px;margin:48px auto;padding:44px;}
-.trust{font-size:20px;font-weight:600;}
-.trust-addr{font-size:13px;color:#555;margin-top:3px;}
-hr{border:none;border-top:1px solid #ddd;margin:22px 0;}
-.rh{display:flex;justify-content:space-between;align-items:baseline;}
-.rt{font-size:22px;font-weight:600;letter-spacing:.5px;}
-.rn{font-size:13px;color:#555;}
-.rd{font-size:13px;color:#555;margin-top:4px;}
-.row{display:flex;justify-content:space-between;padding:11px 0;border-bottom:1px solid #f0f0f0;font-size:14px;}
-.rl{color:#555;}
-.rv{font-weight:500;text-align:right;}
-.sig{margin-top:48px;display:flex;justify-content:flex-end;}
-.si{text-align:center;}
-.sl{border-top:1px solid #1c1c1e;width:200px;margin-bottom:7px;}
-.slb{font-size:12px;color:#555;}
-</style></head><body>
-<div class="page">
-<div class="trust">Your Charitable Trust</div>
-<div class="trust-addr">123 Trust Lane, Mumbai, Maharashtra 400001</div>
-<hr/>
-<div class="rh"><div class="rt">RECEIPT</div><div class="rn">${entry.receiptNo}</div></div>
-<div class="rd">Date: ${dateFormatted}</div>
-<hr/>
-<div class="row"><span class="rl">Received from</span><span class="rv">${entry.vendor}</span></div>
-<div class="row"><span class="rl">Amount</span><span class="rv">${amtFormatted}</span></div>
-<div class="row"><span class="rl">Account</span><span class="rv">${entry.account}</span></div>
-<div class="sig"><div class="si"><div class="sl"></div><div class="slb">Authorised Signatory</div></div></div>
-</div></body></html>`;
-  const blob = new Blob([html], { type: "text/html" });
-  const url = URL.createObjectURL(blob);
-  const win = window.open(url, "_blank");
-  if (win) win.addEventListener("load", () => { setTimeout(() => win.print(), 300); });
 }
 
 // ── SearchableDropdown ─────────────────────────────────────────────────────
@@ -209,7 +178,122 @@ function SearchableDropdown({
   );
 }
 
-// ── Generate Receipt Tab ───────────────────────────────────────────────────
+// ── Direction Toggle ───────────────────────────────────────────────────────
+
+function DirectionToggle({ value, onChange }: { value: Direction; onChange: (d: Direction) => void }) {
+  return (
+    <div className="flex bg-muted rounded-2xl p-1 gap-1">
+      {(["received", "paid"] as Direction[]).map((d) => (
+        <button
+          key={d}
+          onClick={() => onChange(d)}
+          className={`flex-1 h-10 rounded-xl text-sm font-medium transition-all duration-150 active:scale-[0.97] ${
+            value === d
+              ? "bg-white text-primary shadow-[0_1px_3px_rgba(0,0,0,0.08)]"
+              : "text-muted-foreground"
+          }`}
+        >
+          {d === "received" ? "Received from" : "Paid to"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Split Confirm Modal ────────────────────────────────────────────────────
+
+function SplitConfirmModal({
+  parts,
+  startNum,
+  onConfirm,
+  onCancel,
+}: {
+  parts: number[];
+  startNum: number;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 backdrop-blur-[2px]" onClick={onCancel}>
+      <div
+        className="bg-white w-full max-w-sm mx-4 mb-8 rounded-2xl overflow-hidden shadow-[0_8px_40px_rgba(0,0,0,0.18)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 pt-6 pb-4">
+          <div className="font-semibold text-foreground mb-1 text-center">Split into {parts.length} vouchers</div>
+          <div className="text-muted-foreground text-sm text-center mb-4">
+            Amount exceeds the split threshold and will be generated as separate vouchers.
+          </div>
+          <div className="bg-muted rounded-xl overflow-hidden">
+            {parts.map((amt, i) => (
+              <div
+                key={i}
+                className={`flex items-center justify-between px-4 py-3 text-sm ${i < parts.length - 1 ? "border-b border-border" : ""}`}
+              >
+                <span className="text-foreground font-medium">{voucherNoFromNum(startNum + i)}</span>
+                <span className="text-foreground">₹{formatINR(amt)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="border-t border-border flex">
+          <button onClick={onCancel} className="flex-1 h-12 text-foreground font-medium border-r border-border active:bg-muted transition-colors">Cancel</button>
+          <button onClick={onConfirm} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Confirm</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Settings Modal ─────────────────────────────────────────────────────────
+
+function SettingsModal({
+  threshold,
+  onSave,
+  onCancel,
+}: {
+  threshold: number;
+  onSave: (v: number) => void;
+  onCancel: () => void;
+}) {
+  const [val, setVal] = useState(String(threshold));
+
+  function handleSave() {
+    const n = parseFloat(val);
+    if (n > 0) onSave(n);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 backdrop-blur-[2px]" onClick={onCancel}>
+      <div
+        className="bg-white w-full max-w-sm mx-4 mb-8 rounded-2xl overflow-hidden shadow-[0_8px_40px_rgba(0,0,0,0.18)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 pt-6 pb-5">
+          <div className="font-semibold text-foreground mb-1">Split Threshold</div>
+          <div className="text-muted-foreground text-sm mb-4">
+            Vouchers above this amount will be auto-split into smaller pieces.
+          </div>
+          <div className="flex items-center h-14 bg-muted rounded-2xl px-4 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
+            <span className="text-foreground font-medium select-none">₹</span>
+            <input
+              inputMode="decimal"
+              value={val}
+              onChange={(e) => setVal(e.target.value.replace(/[^0-9.]/g, ""))}
+              className="flex-1 bg-transparent outline-none text-foreground text-base"
+            />
+          </div>
+        </div>
+        <div className="border-t border-border flex">
+          <button onClick={onCancel} className="flex-1 h-12 text-foreground font-medium border-r border-border active:bg-muted transition-colors">Cancel</button>
+          <button onClick={handleSave} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Generate Voucher Tab ───────────────────────────────────────────────────
 
 function GenerateTab({
   vendors,
@@ -217,44 +301,80 @@ function GenerateTab({
   onAddVendor,
   onAddAccount,
   history,
-  onSave,
+  threshold,
+  onSaveMany,
 }: {
   vendors: string[];
   accounts: string[];
   onAddVendor: (v: string) => void;
   onAddAccount: (v: string) => void;
-  history: ReceiptEntry[];
-  onSave: (entry: ReceiptEntry) => void;
+  history: VoucherEntry[];
+  threshold: number;
+  onSaveMany: (entries: VoucherEntry[]) => void;
 }) {
+  const [direction, setDirection] = useState<Direction>("received");
   const [vendor, setVendor] = useState("");
   const [amountRaw, setAmountRaw] = useState("");
   const [account, setAccount] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [pendingSplit, setPendingSplit] = useState<{ parts: number[]; startNum: number } | null>(null);
   const dateInputRef = useRef<HTMLInputElement>(null);
+
+  function buildEntries(parts: number[]): VoucherEntry[] {
+    const startNum = maxVoucherNum(history) + 1;
+    return parts.map((amt, i) => ({
+      id: Date.now() + i,
+      direction,
+      vendor,
+      amount: amt,
+      account,
+      date,
+      voucherNo: voucherNoFromNum(startNum + i),
+      ...(parts.length > 1 ? { splitGroup: { index: i + 1, total: parts.length } } : {}),
+    }));
+  }
+
+  function resetForm() {
+    setVendor("");
+    setAmountRaw("");
+    setAccount("");
+    setDate(todayISO());
+    setDirection("received");
+  }
+
+  async function finalize(parts: number[]) {
+    const entries = buildEntries(parts);
+    onSaveMany(entries);
+    try {
+      await openVoucherPDF(entries);
+      toast.success(
+        entries.length > 1 ? `${entries.length} vouchers generated` : `Voucher ${entries[0].voucherNo} generated`,
+      );
+    } catch {
+      toast.error("Voucher saved, but PDF could not be created");
+    }
+    resetForm();
+  }
 
   function handleSubmit() {
     if (!vendor.trim()) { toast.error("Please select a vendor"); return; }
     if (!amountRaw || amountToNumber(amountRaw) === 0) { toast.error("Please enter an amount"); return; }
     if (!account.trim()) { toast.error("Please select an account"); return; }
-    const entry: ReceiptEntry = {
-      id: Date.now(),
-      vendor,
-      amount: amountToNumber(amountRaw),
-      account,
-      date,
-      receiptNo: nextReceiptNo(history),
-    };
-    onSave(entry);
-    openReceiptPDF(entry);
-    toast.success(`Receipt ${entry.receiptNo} generated`);
-    setVendor("");
-    setAmountRaw("");
-    setAccount("");
-    setDate(todayISO());
+
+    const amount = amountToNumber(amountRaw);
+    const parts = computeSplit(amount, threshold);
+
+    if (parts.length > 1) {
+      setPendingSplit({ parts, startNum: maxVoucherNum(history) + 1 });
+    } else {
+      finalize(parts);
+    }
   }
 
   return (
     <div className="flex flex-col gap-4 px-5 pt-6 pb-4">
+      <DirectionToggle value={direction} onChange={setDirection} />
+
       <SearchableDropdown
         placeholder="Vendor"
         options={vendors}
@@ -305,9 +425,18 @@ function GenerateTab({
           onClick={handleSubmit}
           className="w-full h-14 bg-primary text-primary-foreground rounded-2xl font-semibold text-base active:scale-[0.97] transition-transform duration-100 shadow-[0_2px_12px_rgba(0,122,255,0.28)]"
         >
-          Generate Receipt
+          Generate Voucher
         </button>
       </div>
+
+      {pendingSplit && (
+        <SplitConfirmModal
+          parts={pendingSplit.parts}
+          startNum={pendingSplit.startNum}
+          onConfirm={() => { finalize(pendingSplit.parts); setPendingSplit(null); }}
+          onCancel={() => setPendingSplit(null)}
+        />
+      )}
     </div>
   );
 }
@@ -434,10 +563,11 @@ function EditRow({
   entry, vendors, accounts,
   onCommit, onCancel,
 }: {
-  entry: ReceiptEntry; vendors: string[]; accounts: string[];
-  onCommit: (patch: Partial<ReceiptEntry>) => void;
+  entry: VoucherEntry; vendors: string[]; accounts: string[];
+  onCommit: (patch: Partial<VoucherEntry>) => void;
   onCancel: () => void;
 }) {
+  const [direction, setDirection] = useState<Direction>(entry.direction);
   const [vendor, setVendor] = useState(entry.vendor);
   const [amountRaw, setAmountRaw] = useState(() => {
     const n = entry.amount;
@@ -451,6 +581,7 @@ function EditRow({
 
   return (
     <div className="px-4 py-3 bg-accent/40 flex flex-col gap-2.5">
+      <DirectionToggle value={direction} onChange={setDirection} />
       <SearchableDropdown compact placeholder="Vendor" options={vendors} value={vendor} onChange={setVendor} onAddNew={(v) => setVendor(v)} addLabel="Add vendor" />
       <div className="flex items-center h-12 bg-muted rounded-xl px-3 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
         <span className="text-foreground font-medium select-none text-sm">₹</span>
@@ -471,7 +602,7 @@ function EditRow({
       </div>
       <div className="flex gap-2 pt-1">
         <button
-          onClick={() => onCommit({ vendor, amount: amountToNumber(amountRaw), account, date })}
+          onClick={() => onCommit({ direction, vendor, amount: amountToNumber(amountRaw), account, date })}
           className="flex-1 h-10 bg-primary text-white rounded-xl text-sm font-semibold active:scale-[0.97] transition-transform duration-100"
         >
           Save
@@ -497,7 +628,7 @@ function DeleteConfirmModal({ onConfirm, onCancel }: { onConfirm: () => void; on
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-6 pb-4 text-center">
-          <div className="font-semibold text-foreground mb-1">Delete Receipt?</div>
+          <div className="font-semibold text-foreground mb-1">Delete Voucher?</div>
           <div className="text-muted-foreground text-sm">This cannot be undone.</div>
         </div>
         <div className="border-t border-border flex">
@@ -509,15 +640,15 @@ function DeleteConfirmModal({ onConfirm, onCancel }: { onConfirm: () => void; on
   );
 }
 
-// ── Receipt History Tab ────────────────────────────────────────────────────
+// ── Voucher History Tab ────────────────────────────────────────────────────
 
 function HistoryTab({
   history, vendors, accounts, onEdit, onDelete,
 }: {
-  history: ReceiptEntry[];
+  history: VoucherEntry[];
   vendors: string[];
   accounts: string[];
-  onEdit: (id: number, patch: Partial<ReceiptEntry>) => void;
+  onEdit: (id: number, patch: Partial<VoucherEntry>) => void;
   onDelete: (id: number) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -531,7 +662,7 @@ function HistoryTab({
     return r.vendor.toLowerCase().includes(q) || r.date.includes(q) || formatDisplayDate(r.date).toLowerCase().includes(q);
   });
 
-  function startEdit(entry: ReceiptEntry) {
+  function startEdit(entry: VoucherEntry) {
     setEditingId(entry.id);
     setExpandedId(null);
   }
@@ -564,7 +695,7 @@ function HistoryTab({
       <div className="flex-1 overflow-y-auto px-5 pb-4">
         {filtered.length === 0 && (
           <div className="text-center text-muted-foreground text-sm py-12">
-            {history.length === 0 ? "No receipts yet" : "No results found"}
+            {history.length === 0 ? "No vouchers yet" : "No results found"}
           </div>
         )}
         {filtered.length > 0 && (
@@ -590,14 +721,21 @@ function HistoryTab({
                         <span className="text-foreground font-medium text-sm shrink-0">₹{formatINR(entry.amount)}</span>
                       </div>
                       <div className="flex items-center justify-between mt-0.5">
-                        <span className="text-muted-foreground text-xs">{entry.account}</span>
+                        <span className="text-muted-foreground text-xs">{directionLabel(entry.direction)} · {entry.account}</span>
                         <span className="text-muted-foreground text-xs">{formatDisplayDate(entry.date)}</span>
                       </div>
                     </button>
 
                     {expandedId === entry.id && (
                       <div className="px-4 pb-3.5 pt-1 bg-muted/40 flex items-center justify-between">
-                        <span className="text-xs text-muted-foreground font-mono tracking-wide">{entry.receiptNo}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-muted-foreground font-mono tracking-wide">{entry.voucherNo}</span>
+                          {entry.splitGroup && (
+                            <span className="text-[10px] font-medium text-primary bg-accent rounded-full px-2 py-0.5">
+                              Split {entry.splitGroup.index} of {entry.splitGroup.total}
+                            </span>
+                          )}
+                        </div>
                         <div className="flex gap-4">
                           <button
                             onClick={() => startEdit(entry)}
@@ -635,14 +773,33 @@ function HistoryTab({
 // ── App Root ───────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [ready, setReady] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>("generate");
-  const [vendors, setVendors] = useState<string[]>(() => loadLS("vendors", ["Sharma Traders", "Mehta Supplies", "National Books"]));
-  const [accounts, setAccounts] = useState<string[]>(() => loadLS("accounts", ["General Fund", "Education Fund", "Medical Aid"]));
-  const [history, setHistory] = useState<ReceiptEntry[]>(() => loadLS("receipts", []));
+  const [vendors, setVendors] = useState<string[]>([]);
+  const [accounts, setAccounts] = useState<string[]>([]);
+  const [history, setHistory] = useState<VoucherEntry[]>([]);
+  const [threshold, setThreshold] = useState<number>(DEFAULT_SPLIT_THRESHOLD);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
-  useEffect(() => { saveLS("vendors", vendors); }, [vendors]);
-  useEffect(() => { saveLS("accounts", accounts); }, [accounts]);
-  useEffect(() => { saveLS("receipts", history); }, [history]);
+  useEffect(() => {
+    initAppData()
+      .then((data) => {
+        setVendors(data.vendors);
+        setAccounts(data.accounts);
+        setHistory(data.vouchers);
+        setThreshold(data.splitThreshold);
+        setReady(true);
+      })
+      .catch(() => {
+        toast.error("Failed to load saved data");
+        setReady(true);
+      });
+  }, []);
+
+  useEffect(() => { if (ready) setItem("vendors", vendors); }, [ready, vendors]);
+  useEffect(() => { if (ready) setItem("accounts", accounts); }, [ready, accounts]);
+  useEffect(() => { if (ready) setItem("vouchers", history); }, [ready, history]);
+  useEffect(() => { if (ready) setItem("splitThreshold", threshold); }, [ready, threshold]);
 
   const addVendor = useCallback((v: string) => setVendors((p) => p.includes(v) ? p : [...p, v]), []);
   const editVendor = useCallback((i: number, v: string) => setVendors((p) => p.map((x, idx) => idx === i ? v : x)), []);
@@ -652,25 +809,66 @@ export default function App() {
   const editAccount = useCallback((i: number, v: string) => setAccounts((p) => p.map((x, idx) => idx === i ? v : x)), []);
   const deleteAccount = useCallback((i: number) => setAccounts((p) => p.filter((_, idx) => idx !== i)), []);
 
-  const saveReceipt = useCallback((entry: ReceiptEntry) => setHistory((p) => [...p, entry]), []);
-  const editReceipt = useCallback((id: number, patch: Partial<ReceiptEntry>) => {
-    setHistory((p) => p.map((r) => r.id === id ? { ...r, ...patch } : r));
-  }, []);
-  const deleteReceipt = useCallback((id: number) => setHistory((p) => p.filter((r) => r.id !== id)), []);
+  const saveVouchers = useCallback((entries: VoucherEntry[]) => setHistory((p) => [...p, ...entries]), []);
+
+  const editVoucher = useCallback((id: number, patch: Partial<VoucherEntry>) => {
+    setHistory((prev) => {
+      const target = prev.find((r) => r.id === id);
+      if (!target) return prev;
+      const merged: VoucherEntry = { ...target, ...patch };
+
+      if (merged.amount > threshold) {
+        const parts = computeSplit(merged.amount, threshold);
+        if (parts.length > 1) {
+          const withoutTarget = prev.filter((r) => r.id !== id);
+          const startNum = maxVoucherNum(prev) + 1;
+          const newEntries: VoucherEntry[] = parts.map((amt, i) => ({
+            id: Date.now() + i,
+            direction: merged.direction,
+            vendor: merged.vendor,
+            amount: amt,
+            account: merged.account,
+            date: merged.date,
+            voucherNo: voucherNoFromNum(startNum + i),
+            splitGroup: { index: i + 1, total: parts.length },
+          }));
+          return [...withoutTarget, ...newEntries];
+        }
+      }
+
+      return prev.map((r) => (r.id === id ? merged : r));
+    });
+  }, [threshold]);
+
+  const deleteVoucher = useCallback((id: number) => setHistory((p) => p.filter((r) => r.id !== id)), []);
 
   const tabTitles: Record<Tab, string> = {
-    generate: "New Receipt",
+    generate: "New Voucher",
     master: "Master Data",
-    history: "Receipt History",
+    history: "Voucher History",
   };
+
+  if (!ready) {
+    return (
+      <div className="flex items-center justify-center h-full bg-background text-muted-foreground text-sm">
+        Loading…
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-background max-w-md mx-auto relative overflow-hidden">
       <Toaster position="top-center" richColors />
 
       {/* Status bar spacer + header */}
-      <div className="flex-shrink-0 bg-background px-5 pt-14 pb-3 border-b border-border">
+      <div className="flex-shrink-0 bg-background px-5 pt-14 pb-3 border-b border-border flex items-center justify-between">
         <h1 className="text-[22px] font-semibold text-foreground tracking-tight">{tabTitles[activeTab]}</h1>
+        <button
+          onClick={() => setSettingsOpen(true)}
+          className="text-muted-foreground active:scale-90 transition-transform duration-100 p-1"
+        >
+          <SettingsIcon size={20} />
+        </button>
       </div>
 
       {/* Tab content */}
@@ -683,7 +881,8 @@ export default function App() {
               onAddVendor={addVendor}
               onAddAccount={addAccount}
               history={history}
-              onSave={saveReceipt}
+              threshold={threshold}
+              onSaveMany={saveVouchers}
             />
           </div>
         )}
@@ -706,8 +905,8 @@ export default function App() {
             history={history}
             vendors={vendors}
             accounts={accounts}
-            onEdit={editReceipt}
-            onDelete={deleteReceipt}
+            onEdit={editVoucher}
+            onDelete={deleteVoucher}
           />
         )}
       </div>
@@ -736,6 +935,14 @@ export default function App() {
         </div>
         <div className="pb-1" />
       </div>
+
+      {settingsOpen && (
+        <SettingsModal
+          threshold={threshold}
+          onSave={(v) => { setThreshold(v); setSettingsOpen(false); }}
+          onCancel={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }
