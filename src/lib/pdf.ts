@@ -41,9 +41,10 @@ async function loadDevanagariFont(): Promise<string | null> {
       })
       .then((buffer) => {
         const bytes = new Uint8Array(buffer);
+        const chunkSize = 8192;
         let binary = "";
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
         }
         return btoa(binary);
       })
@@ -81,7 +82,7 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
   doc.text(entry.voucherNo, 190, y + 6, { align: "right" });
   doc.setTextColor(28, 28, 30);
   y += 14;
-  doc.setFont(deva, "normal");
+  doc.setFont("helvetica", "normal");
   doc.text(`Date: ${formatDisplayDate(entry.date)}`, 20, y);
 
   y = addDivider(doc, y + 6);
@@ -94,7 +95,7 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
 
   doc.setFontSize(12);
   for (const [label, value] of rows) {
-    doc.setFont(deva, "normal");
+    doc.setFont("helvetica", "normal");
     doc.setTextColor(85, 85, 85);
     doc.text(label, 20, y);
     doc.setTextColor(28, 28, 30);
