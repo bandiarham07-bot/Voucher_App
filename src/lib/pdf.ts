@@ -86,7 +86,7 @@ function drawVoucherPage(doc: jsPDF, entry: VoucherPDFEntry, fontLoaded: boolean
 
   const rows: [string, string][] = [
     [directionLabel(entry.direction), entry.vendor],
-    ["Amount", `₹ ${formatINR(entry.amount)}`],
+    ["Amount", `Rs. ${formatINR(entry.amount)}`],
     ["Account", entry.account],
   ];
 
