@@ -1,6 +1,6 @@
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
-import type { PaymentType, VoucherLineItem } from "../app/types";
+import type { PaymentType, VoucherEntry, VoucherLineItem } from "../app/types";
 
 export interface VoucherPDFEntry {
   vendor: string;
@@ -14,6 +14,24 @@ export interface VoucherPDFEntry {
   bankName?: string;
   date: string;
   voucherNo: string;
+}
+
+/** Convert a stored history entry back into the shape the PDF builder expects.
+ *  Used both for the initial generation and for regenerating from History. */
+export function voucherEntryToPDFEntry(entry: VoucherEntry): VoucherPDFEntry {
+  return {
+    vendor: entry.vendor,
+    amount: entry.amount,
+    account: entry.account,
+    lineItems: entry.lineItems,
+    haste: entry.haste,
+    remarks: entry.remarks,
+    paymentType: entry.paymentType,
+    chequeNo: entry.chequeNo,
+    bankName: entry.bankName,
+    date: entry.date,
+    voucherNo: entry.voucherNo,
+  };
 }
 
 const TRUST_DATA = {
@@ -181,7 +199,16 @@ function buildVoucherHTML(entry: VoucherPDFEntry): string {
     </div>`;
 }
 
-async function renderVoucherToCanvas(entry: VoucherPDFEntry): Promise<HTMLCanvasElement> {
+/** Lower the render scale as batch size grows, since memory pressure from many
+ *  back-to-back html2canvas renders (each ~scale^2 pixels) is the main reason
+ *  large split batches were failing to produce a PDF on phones/PWAs. */
+function scaleForBatch(count: number): number {
+  if (count <= 4) return 2;
+  if (count <= 8) return 1.5;
+  return 1.25;
+}
+
+async function renderVoucherToCanvas(entry: VoucherPDFEntry, scale: number): Promise<HTMLCanvasElement> {
   const container = document.createElement("div");
   container.style.position = "fixed";
   container.style.left = "-9999px";
@@ -189,30 +216,68 @@ async function renderVoucherToCanvas(entry: VoucherPDFEntry): Promise<HTMLCanvas
   container.style.width = "680px";
   container.innerHTML = buildVoucherHTML(entry);
   document.body.appendChild(container);
-  await document.fonts.ready;
-  const canvas = await html2canvas(container, {
-    scale: 2,
-    useCORS: true,
-    backgroundColor: "#ffffff",
-    width: 680,
-  });
-  document.body.removeChild(container);
-  return canvas;
+  try {
+    await document.fonts.ready;
+    return await html2canvas(container, {
+      scale,
+      useCORS: true,
+      backgroundColor: "#ffffff",
+      width: 680,
+    });
+  } finally {
+    // Always remove the offscreen container, even if html2canvas throws.
+    container.remove();
+  }
 }
 
-async function buildVoucherPDF(entries: VoucherPDFEntry[]): Promise<Blob> {
+function freeCanvas(canvas: HTMLCanvasElement) {
+  // Dropping the backing pixel buffer immediately (instead of waiting for GC)
+  // matters a lot on memory-constrained mobile WebViews when rendering many pages back to back.
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+export interface VoucherPDFResult {
+  blob: Blob;
+  failed: { voucherNo: string }[];
+}
+
+async function buildVoucherPDF(entries: VoucherPDFEntry[]): Promise<VoucherPDFResult> {
   const doc = new jsPDF({ unit: "mm", format: "a4" });
   const pageW = 210;
   const pageH = 297;
+  const scale = scaleForBatch(entries.length);
+  const failed: { voucherNo: string }[] = [];
+  let pagesAdded = 0;
+
   for (let i = 0; i < entries.length; i++) {
-    if (i > 0) doc.addPage();
-    const canvas = await renderVoucherToCanvas(entries[i]);
-    const imgData = canvas.toDataURL("image/png");
-    const imgW = 180;
-    const imgH = imgW * (canvas.height / canvas.width);
-    doc.addImage(imgData, "PNG", (pageW - imgW) / 2, 12, imgW, Math.min(imgH, pageH - 24));
+    let canvas: HTMLCanvasElement | null = null;
+    try {
+      canvas = await renderVoucherToCanvas(entries[i], scale);
+      const imgData = canvas.toDataURL("image/png");
+      const imgW = 180;
+      const imgH = imgW * (canvas.height / canvas.width);
+      if (pagesAdded > 0) doc.addPage();
+      doc.addImage(imgData, "PNG", (pageW - imgW) / 2, 12, imgW, Math.min(imgH, pageH - 24));
+      pagesAdded++;
+    } catch (err) {
+      // Don't let one bad page take down the whole batch — record it and keep going,
+      // so the user still gets a PDF with everything that did render.
+      console.error(`Voucher PDF: failed to render ${entries[i].voucherNo}`, err);
+      failed.push({ voucherNo: entries[i].voucherNo });
+    } finally {
+      if (canvas) freeCanvas(canvas);
+    }
+    // Yield to the browser between heavy renders so it has a chance to reclaim
+    // memory before starting the next one (helps a lot on installed PWAs/phones).
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
   }
-  return doc.output("blob");
+
+  if (pagesAdded === 0) {
+    throw new Error("Could not render any receipt pages for this PDF.");
+  }
+
+  return { blob: doc.output("blob"), failed };
 }
 
 async function shareOrDownload(blob: Blob, filename: string) {
@@ -229,11 +294,12 @@ async function shareOrDownload(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-export async function openVoucherPDF(entries: VoucherPDFEntry[]) {
-  const blob = await buildVoucherPDF(entries);
+export async function openVoucherPDF(entries: VoucherPDFEntry[]): Promise<{ failed: { voucherNo: string }[] }> {
+  const { blob, failed } = await buildVoucherPDF(entries);
   const filename =
     entries.length === 1
       ? `${entries[0].voucherNo}.pdf`
       : `receipts-${entries[0].voucherNo}-to-${entries[entries.length - 1].voucherNo}.pdf`;
   await shareOrDownload(blob, filename);
+  return { failed };
 }
