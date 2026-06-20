@@ -3,8 +3,8 @@ import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, Chevr
 import { Toaster, toast } from "sonner";
 import { initAppData, setItem } from "../lib/db";
 import { openVoucherPDF } from "../lib/pdf";
-import type { Direction, Tab, VoucherEntry } from "./types";
-import { DEFAULT_SPLIT_THRESHOLD } from "./types";
+import type { PaymentType, Tab, VoucherEntry, VoucherLineItem } from "./types";
+import { DEFAULT_SPLIT_THRESHOLD, SPLIT_TRIGGER_AMOUNT } from "./types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -39,47 +39,54 @@ function formatDisplayDate(iso: string): string {
   return `${parseInt(d)} ${months[parseInt(m) - 1]} ${y}`;
 }
 
-function directionLabel(direction: Direction): string {
-  return direction === "paid" ? "Paid to" : "Received from";
-}
-
 function maxVoucherNum(history: VoucherEntry[]): number {
   return history.reduce((acc, r) => {
-    const n = parseInt(r.voucherNo.replace("VCH-", "")) || 0;
+    const n = parseInt(r.voucherNo.replace(/^(VCH|RCP)-/, "")) || 0;
     return Math.max(acc, n);
   }, 0);
 }
 
 function voucherNoFromNum(n: number): string {
-  return "VCH-" + String(n).padStart(4, "0");
+  return "RCP-" + String(n).padStart(4, "0");
 }
 
-// Splits an amount into the minimum number of whole-rupee parts, each
-// strictly under `threshold`. Any leftover paise is added entirely to the
-// last piece so the total still matches exactly. Returns [amount] unchanged
-// if it doesn't exceed the threshold.
-function computeSplit(amount: number, threshold: number): number[] {
-  if (amount <= threshold) return [amount];
+function normalizeLineItems(entry: VoucherEntry): VoucherLineItem[] {
+  return entry.lineItems?.length ? entry.lineItems : [{ account: entry.account, amount: entry.amount, remarks: entry.remarks }];
+}
 
-  const totalPaiseInt = Math.round(amount * 100);
-  const paise = totalPaiseInt % 100;
-  const rupees = (totalPaiseInt - paise) / 100;
+function sumLineItems(lines: VoucherLineItem[]): number {
+  return Math.round(lines.reduce((acc, line) => acc + line.amount, 0) * 100) / 100;
+}
 
-  const n = Math.ceil(rupees / (threshold - 1));
-  const base = Math.floor(rupees / n);
-  const remainder = rupees % n;
+function splitLineItems(lines: VoucherLineItem[], maxReceiptAmount: number): VoucherLineItem[][] {
+  const receipts: VoucherLineItem[][] = [];
+  let current: VoucherLineItem[] = [];
+  let currentTotal = 0;
 
-  const parts: number[] = [];
-  for (let i = 0; i < n; i++) {
-    parts.push(base + (i < remainder ? 1 : 0));
+  for (const line of lines) {
+    let remaining = Math.round(line.amount * 100) / 100;
+    while (remaining > 0) {
+      const room = Math.max(0, maxReceiptAmount - currentTotal);
+      if (room <= 0) {
+        receipts.push(current);
+        current = [];
+        currentTotal = 0;
+        continue;
+      }
+      const take = Math.round(Math.min(remaining, room) * 100) / 100;
+      current.push({ ...line, amount: take });
+      currentTotal = Math.round((currentTotal + take) * 100) / 100;
+      remaining = Math.round((remaining - take) * 100) / 100;
+      if (remaining > 0) {
+        receipts.push(current);
+        current = [];
+        currentTotal = 0;
+      }
+    }
   }
 
-  if (paise > 0) {
-    const lastIdx = parts.length - 1;
-    parts[lastIdx] = Math.round((parts[lastIdx] + paise / 100) * 100) / 100;
-  }
-
-  return parts;
+  if (current.length) receipts.push(current);
+  return receipts;
 }
 
 function handleAmountInput(raw: string): string {
@@ -178,12 +185,10 @@ function SearchableDropdown({
   );
 }
 
-// ── Direction Toggle ───────────────────────────────────────────────────────
-
-function DirectionToggle({ value, onChange }: { value: Direction; onChange: (d: Direction) => void }) {
+function PaymentTypeToggle({ value, onChange }: { value: PaymentType; onChange: (d: PaymentType) => void }) {
   return (
     <div className="flex bg-muted rounded-2xl p-1 gap-1">
-      {(["received", "paid"] as Direction[]).map((d) => (
+      {(["नगदी", "चेक", "ऑनलाइन"] as PaymentType[]).map((d) => (
         <button
           key={d}
           onClick={() => onChange(d)}
@@ -193,7 +198,7 @@ function DirectionToggle({ value, onChange }: { value: Direction; onChange: (d: 
               : "text-muted-foreground"
           }`}
         >
-          {d === "received" ? "Received from" : "Paid to"}
+          {d}
         </button>
       ))}
     </div>
@@ -203,12 +208,12 @@ function DirectionToggle({ value, onChange }: { value: Direction; onChange: (d: 
 // ── Split Confirm Modal ────────────────────────────────────────────────────
 
 function SplitConfirmModal({
-  parts,
+  groups,
   startNum,
   onConfirm,
   onCancel,
 }: {
-  parts: number[];
+  groups: VoucherLineItem[][];
   startNum: number;
   onConfirm: () => void;
   onCancel: () => void;
@@ -220,25 +225,32 @@ function SplitConfirmModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-6 pb-4">
-          <div className="font-semibold text-foreground mb-1 text-center">Split into {parts.length} vouchers</div>
+          <div className="font-semibold text-foreground mb-1 text-center">Split into {groups.length} receipts</div>
           <div className="text-muted-foreground text-sm text-center mb-4">
-            Amount exceeds the split threshold and will be generated as separate vouchers.
+            Total exceeds the split threshold and will be generated as separate receipts.
           </div>
           <div className="bg-muted rounded-xl overflow-hidden">
-            {parts.map((amt, i) => (
+            {groups.map((lines, i) => {
+              const amt = sumLineItems(lines);
+              return (
               <div
                 key={i}
-                className={`flex items-center justify-between px-4 py-3 text-sm ${i < parts.length - 1 ? "border-b border-border" : ""}`}
+                className={`px-4 py-3 text-sm ${i < groups.length - 1 ? "border-b border-border" : ""}`}
               >
-                <span className="text-foreground font-medium">{voucherNoFromNum(startNum + i)}</span>
-                <span className="text-foreground">₹{formatINR(amt)}</span>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-foreground font-medium">{voucherNoFromNum(startNum + i)}</span>
+                  <span className="text-foreground">₹{formatINR(amt)}</span>
+                </div>
+                <div className="text-muted-foreground text-xs mt-1 leading-relaxed">
+                  {lines.map((line) => `₹${formatINR(line.amount)} from ${line.account}`).join(" · ")}
+                </div>
               </div>
-            ))}
+            )})}
           </div>
         </div>
         <div className="border-t border-border flex">
           <button onClick={onCancel} className="flex-1 h-12 text-foreground font-medium border-r border-border active:bg-muted transition-colors">Cancel</button>
-          <button onClick={onConfirm} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Confirm</button>
+          <button onClick={onConfirm} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Confirm & Generate All</button>
         </div>
       </div>
     </div>
@@ -312,43 +324,56 @@ function GenerateTab({
   threshold: number;
   onSaveMany: (entries: VoucherEntry[]) => void;
 }) {
-  const [direction, setDirection] = useState<Direction>("received");
   const [vendor, setVendor] = useState("");
-  const [amountRaw, setAmountRaw] = useState("");
-  const [account, setAccount] = useState("");
+  const [haste, setHaste] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [paymentType, setPaymentType] = useState<PaymentType>("नगदी");
+  const [bankName, setBankName] = useState("");
+  const [chequeNo, setChequeNo] = useState("");
+  const [lineRows, setLineRows] = useState([{ account: "", amountRaw: "", remarks: "" }]);
   const [date, setDate] = useState(todayISO());
-  const [pendingSplit, setPendingSplit] = useState<{ parts: number[]; startNum: number } | null>(null);
+  const [pendingSplit, setPendingSplit] = useState<{ groups: VoucherLineItem[][]; startNum: number } | null>(null);
   const dateInputRef = useRef<HTMLInputElement>(null);
+  const totalAmount = sumLineItems(lineRows.map((line) => ({ account: line.account, amount: amountToNumber(line.amountRaw), remarks: line.remarks })));
 
-  function buildEntries(parts: number[]): VoucherEntry[] {
+  function buildEntries(groups: VoucherLineItem[][]): VoucherEntry[] {
     const startNum = maxVoucherNum(history) + 1;
-    return parts.map((amt, i) => ({
+    const groupId = groups.length > 1 ? Date.now() : undefined;
+    return groups.map((lines, i) => ({
       id: Date.now() + i,
-      direction,
       vendor,
-      amount: amt,
-      account,
+      amount: sumLineItems(lines),
+      account: lines.map((line) => line.account).join(", "),
+      lineItems: lines,
+      haste,
+      remarks,
+      paymentType,
+      bankName: paymentType === "चेक" ? bankName : "",
+      chequeNo: paymentType === "चेक" ? chequeNo : "",
       date,
       voucherNo: voucherNoFromNum(startNum + i),
-      ...(parts.length > 1 ? { splitGroup: { index: i + 1, total: parts.length } } : {}),
+      ...(groups.length > 1 ? { splitGroup: { index: i + 1, total: groups.length, groupId } } : {}),
     }));
   }
 
   function resetForm() {
     setVendor("");
-    setAmountRaw("");
-    setAccount("");
+    setHaste("");
+    setRemarks("");
+    setPaymentType("नगदी");
+    setBankName("");
+    setChequeNo("");
+    setLineRows([{ account: "", amountRaw: "", remarks: "" }]);
     setDate(todayISO());
-    setDirection("received");
   }
 
-  async function finalize(parts: number[]) {
-    const entries = buildEntries(parts);
+  async function finalize(groups: VoucherLineItem[][]) {
+    const entries = buildEntries(groups);
     onSaveMany(entries);
     try {
       await openVoucherPDF(entries);
       toast.success(
-        entries.length > 1 ? `${entries.length} vouchers generated` : `Voucher ${entries[0].voucherNo} generated`,
+        entries.length > 1 ? `${entries.length} receipts generated` : `Receipt ${entries[0].voucherNo} generated`,
       );
     } catch {
       toast.error("Voucher saved, but PDF could not be created");
@@ -357,52 +382,131 @@ function GenerateTab({
   }
 
   function handleSubmit() {
-    if (!vendor.trim()) { toast.error("Please select a vendor"); return; }
-    if (!amountRaw || amountToNumber(amountRaw) === 0) { toast.error("Please enter an amount"); return; }
-    if (!account.trim()) { toast.error("Please select an account"); return; }
+    if (!vendor.trim()) { toast.error("Please select a parivar"); return; }
+    const lines = lineRows
+      .map((line) => ({ account: line.account.trim(), amount: amountToNumber(line.amountRaw), remarks: line.remarks.trim() }))
+      .filter((line) => line.account || line.amount > 0 || line.remarks);
+    if (!lines.length || lines.some((line) => !line.account || line.amount <= 0)) {
+      toast.error("Please complete every account row");
+      return;
+    }
+    const accountsUsed = lines.map((line) => line.account.toLowerCase());
+    if (new Set(accountsUsed).size !== accountsUsed.length) {
+      toast.error("Duplicate accounts are not allowed in one receipt");
+      return;
+    }
+    if (paymentType === "चेक" && (!bankName.trim() || !chequeNo.trim())) {
+      toast.error("Please enter bank name and cheque no.");
+      return;
+    }
 
-    const amount = amountToNumber(amountRaw);
-    const parts = computeSplit(amount, threshold);
+    const groups = totalAmount > SPLIT_TRIGGER_AMOUNT ? splitLineItems(lines, threshold) : [lines];
 
-    if (parts.length > 1) {
-      setPendingSplit({ parts, startNum: maxVoucherNum(history) + 1 });
+    if (groups.length > 1) {
+      setPendingSplit({ groups, startNum: maxVoucherNum(history) + 1 });
     } else {
-      finalize(parts);
+      finalize(groups);
     }
   }
 
   return (
     <div className="flex flex-col gap-4 px-5 pt-6 pb-4">
-      <DirectionToggle value={direction} onChange={setDirection} />
-
       <SearchableDropdown
-        placeholder="Vendor"
+        placeholder="Parivar"
         options={vendors}
         value={vendor}
         onChange={setVendor}
         onAddNew={onAddVendor}
-        addLabel="Add vendor"
+        addLabel="Add parivar"
       />
 
-      <div className="flex items-center h-14 bg-muted rounded-2xl px-4 gap-2 transition-all duration-150 focus-within:ring-2 focus-within:ring-primary/40">
-        <span className="text-foreground font-medium select-none">₹</span>
+      <div className="flex items-center h-14 bg-muted rounded-2xl px-4 transition-all duration-150 focus-within:ring-2 focus-within:ring-primary/40">
         <input
-          placeholder="Amount"
-          value={amountRaw}
-          inputMode="decimal"
-          onChange={(e) => setAmountRaw(handleAmountInput(e.target.value))}
+          placeholder="हस्ते (optional)"
+          value={haste}
+          onChange={(e) => setHaste(e.target.value)}
           className="flex-1 bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-base"
         />
       </div>
 
-      <SearchableDropdown
-        placeholder="Account"
-        options={accounts}
-        value={account}
-        onChange={setAccount}
-        onAddNew={onAddAccount}
-        addLabel="Add account"
-      />
+      <div className="flex items-center h-14 bg-muted rounded-2xl px-4 transition-all duration-150 focus-within:ring-2 focus-within:ring-primary/40">
+        <input
+          placeholder="Remarks"
+          value={remarks}
+          onChange={(e) => setRemarks(e.target.value)}
+          className="flex-1 bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-base"
+        />
+      </div>
+
+      <PaymentTypeToggle value={paymentType} onChange={setPaymentType} />
+
+      {paymentType === "चेक" && (
+        <div className="grid grid-cols-2 gap-2">
+          <div className="flex items-center h-14 bg-muted rounded-2xl px-4 focus-within:ring-2 focus-within:ring-primary/40">
+            <input placeholder="Bank Name" value={bankName} onChange={(e) => setBankName(e.target.value)} className="w-full bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-base" />
+          </div>
+          <div className="flex items-center h-14 bg-muted rounded-2xl px-4 focus-within:ring-2 focus-within:ring-primary/40">
+            <input placeholder="Cheque No" value={chequeNo} onChange={(e) => setChequeNo(e.target.value)} className="w-full bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-base" />
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-col gap-3">
+        {lineRows.map((line, idx) => {
+          const used = new Set(lineRows.map((row, rowIdx) => rowIdx === idx ? "" : row.account).filter(Boolean));
+          return (
+            <div key={idx} className="bg-white border border-border rounded-2xl p-3 flex flex-col gap-2">
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <SearchableDropdown
+                    compact
+                    placeholder="Account"
+                    options={accounts.filter((account) => !used.has(account) || account === line.account)}
+                    value={line.account}
+                    onChange={(account) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, account } : row))}
+                    onAddNew={onAddAccount}
+                    addLabel="Add account"
+                  />
+                </div>
+                <button
+                  onClick={() => setLineRows((rows) => rows.length > 1 ? rows.filter((_, rowIdx) => rowIdx !== idx) : rows)}
+                  className="w-12 h-12 rounded-xl bg-muted text-destructive flex items-center justify-center active:scale-[0.97]"
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
+              <div className="flex items-center h-12 bg-muted rounded-xl px-3 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
+                <span className="text-foreground font-medium select-none text-sm">₹</span>
+                <input
+                  placeholder="Amount"
+                  value={line.amountRaw}
+                  inputMode="decimal"
+                  onChange={(e) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, amountRaw: handleAmountInput(e.target.value) } : row))}
+                  className="flex-1 bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-sm"
+                />
+              </div>
+              <div className="flex items-center h-12 bg-muted rounded-xl px-3 focus-within:ring-2 focus-within:ring-primary/40">
+                <input
+                  placeholder="Line remarks"
+                  value={line.remarks}
+                  onChange={(e) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, remarks: e.target.value } : row))}
+                  className="flex-1 bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-sm"
+                />
+              </div>
+            </div>
+          );
+        })}
+        <button
+          onClick={() => setLineRows((rows) => [...rows, { account: "", amountRaw: "", remarks: "" }])}
+          className="h-11 rounded-xl border border-dashed border-primary/50 text-primary text-sm font-semibold flex items-center justify-center gap-2 active:scale-[0.97]"
+        >
+          <Plus size={15} /> Add account row
+        </button>
+        <div className="flex items-center justify-between px-1 text-sm">
+          <span className="text-muted-foreground">Total</span>
+          <span className="font-semibold text-foreground">₹{formatINR(totalAmount)}</span>
+        </div>
+      </div>
 
       <div
         className="flex items-center h-14 bg-muted rounded-2xl px-4 cursor-pointer relative"
@@ -425,15 +529,15 @@ function GenerateTab({
           onClick={handleSubmit}
           className="w-full h-14 bg-primary text-primary-foreground rounded-2xl font-semibold text-base active:scale-[0.97] transition-transform duration-100 shadow-[0_2px_12px_rgba(0,122,255,0.28)]"
         >
-          Generate Voucher
+          Generate Receipt
         </button>
       </div>
 
       {pendingSplit && (
         <SplitConfirmModal
-          parts={pendingSplit.parts}
+          groups={pendingSplit.groups}
           startNum={pendingSplit.startNum}
-          onConfirm={() => { finalize(pendingSplit.parts); setPendingSplit(null); }}
+          onConfirm={() => { finalize(pendingSplit.groups); setPendingSplit(null); }}
           onCancel={() => setPendingSplit(null)}
         />
       )}
@@ -551,7 +655,7 @@ function MasterTab({
 }) {
   return (
     <div className="px-5 pt-6 pb-4">
-      <ListSection title="Vendors" items={vendors} onAdd={onAddVendor} onEdit={onEditVendor} onDelete={onDeleteVendor} />
+      <ListSection title="Parivars" items={vendors} onAdd={onAddVendor} onEdit={onEditVendor} onDelete={onDeleteVendor} />
       <ListSection title="Accounts" items={accounts} onAdd={onAddAccount} onEdit={onEditAccount} onDelete={onDeleteAccount} />
     </div>
   );
@@ -567,32 +671,49 @@ function EditRow({
   onCommit: (patch: Partial<VoucherEntry>) => void;
   onCancel: () => void;
 }) {
-  const [direction, setDirection] = useState<Direction>(entry.direction);
   const [vendor, setVendor] = useState(entry.vendor);
-  const [amountRaw, setAmountRaw] = useState(() => {
-    const n = entry.amount;
-    const intPart = String(Math.floor(n));
-    const dec = n % 1 !== 0 ? "." + n.toFixed(2).split(".")[1] : "";
-    return formatIndianInteger(intPart) + dec;
-  });
-  const [account, setAccount] = useState(entry.account);
+  const [haste, setHaste] = useState(entry.haste ?? "");
+  const [remarks, setRemarks] = useState(entry.remarks ?? "");
+  const [paymentType, setPaymentType] = useState<PaymentType>(entry.paymentType ?? "नगदी");
+  const [bankName, setBankName] = useState(entry.bankName ?? "");
+  const [chequeNo, setChequeNo] = useState(entry.chequeNo ?? "");
+  const [lineRows, setLineRows] = useState(() => normalizeLineItems(entry).map((line) => ({
+    account: line.account,
+    remarks: line.remarks ?? "",
+    amountRaw: formatIndianInteger(String(Math.floor(line.amount))) + (line.amount % 1 !== 0 ? "." + line.amount.toFixed(2).split(".")[1] : ""),
+  })));
   const [date, setDate] = useState(entry.date);
   const dateRef = useRef<HTMLInputElement>(null);
+  const lines = lineRows.map((line) => ({ account: line.account, amount: amountToNumber(line.amountRaw), remarks: line.remarks }));
+  const amount = sumLineItems(lines);
 
   return (
     <div className="px-4 py-3 bg-accent/40 flex flex-col gap-2.5">
-      <DirectionToggle value={direction} onChange={setDirection} />
-      <SearchableDropdown compact placeholder="Vendor" options={vendors} value={vendor} onChange={setVendor} onAddNew={(v) => setVendor(v)} addLabel="Add vendor" />
-      <div className="flex items-center h-12 bg-muted rounded-xl px-3 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
-        <span className="text-foreground font-medium select-none text-sm">₹</span>
-        <input
-          value={amountRaw}
-          inputMode="decimal"
-          onChange={(e) => setAmountRaw(handleAmountInput(e.target.value))}
-          className="flex-1 bg-transparent outline-none text-foreground text-sm"
-        />
-      </div>
-      <SearchableDropdown compact placeholder="Account" options={accounts} value={account} onChange={setAccount} onAddNew={(v) => setAccount(v)} addLabel="Add account" />
+      <SearchableDropdown compact placeholder="Parivar" options={vendors} value={vendor} onChange={setVendor} onAddNew={(v) => setVendor(v)} addLabel="Add parivar" />
+      <input className="h-12 bg-muted rounded-xl px-3 outline-none text-sm" placeholder="हस्ते" value={haste} onChange={(e) => setHaste(e.target.value)} />
+      <input className="h-12 bg-muted rounded-xl px-3 outline-none text-sm" placeholder="Remarks" value={remarks} onChange={(e) => setRemarks(e.target.value)} />
+      <PaymentTypeToggle value={paymentType} onChange={setPaymentType} />
+      {paymentType === "चेक" && (
+        <div className="grid grid-cols-2 gap-2">
+          <input className="h-12 bg-muted rounded-xl px-3 outline-none text-sm" placeholder="Bank Name" value={bankName} onChange={(e) => setBankName(e.target.value)} />
+          <input className="h-12 bg-muted rounded-xl px-3 outline-none text-sm" placeholder="Cheque No" value={chequeNo} onChange={(e) => setChequeNo(e.target.value)} />
+        </div>
+      )}
+      {lineRows.map((line, idx) => (
+        <div key={idx} className="flex flex-col gap-2 rounded-xl bg-white/70 p-2">
+          <SearchableDropdown compact placeholder="Account" options={accounts} value={line.account} onChange={(account) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, account } : row))} onAddNew={(v) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, account: v } : row))} addLabel="Add account" />
+          <div className="flex gap-2">
+            <div className="flex flex-1 items-center h-12 bg-muted rounded-xl px-3 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
+              <span className="text-foreground font-medium select-none text-sm">₹</span>
+              <input value={line.amountRaw} inputMode="decimal" onChange={(e) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, amountRaw: handleAmountInput(e.target.value) } : row))} className="flex-1 bg-transparent outline-none text-foreground text-sm" />
+            </div>
+            <button onClick={() => setLineRows((rows) => rows.length > 1 ? rows.filter((_, rowIdx) => rowIdx !== idx) : rows)} className="w-12 h-12 rounded-xl bg-muted text-destructive flex items-center justify-center"><Trash2 size={14} /></button>
+          </div>
+          <input className="h-12 bg-muted rounded-xl px-3 outline-none text-sm" placeholder="Line remarks" value={line.remarks} onChange={(e) => setLineRows((rows) => rows.map((row, rowIdx) => rowIdx === idx ? { ...row, remarks: e.target.value } : row))} />
+        </div>
+      ))}
+      <button onClick={() => setLineRows((rows) => [...rows, { account: "", amountRaw: "", remarks: "" }])} className="h-10 rounded-xl border border-dashed border-primary/50 text-primary text-sm font-semibold">Add account row</button>
+      <div className="flex justify-between text-sm px-1"><span className="text-muted-foreground">Total</span><span className="font-semibold">₹{formatINR(amount)}</span></div>
       <div
         className="flex items-center h-12 bg-muted rounded-xl px-3 cursor-pointer relative"
         onClick={() => dateRef.current?.showPicker?.()}
@@ -602,7 +723,7 @@ function EditRow({
       </div>
       <div className="flex gap-2 pt-1">
         <button
-          onClick={() => onCommit({ direction, vendor, amount: amountToNumber(amountRaw), account, date })}
+          onClick={() => onCommit({ vendor, amount, account: lines.map((line) => line.account).join(", "), lineItems: lines, haste, remarks, paymentType, bankName: paymentType === "चेक" ? bankName : "", chequeNo: paymentType === "चेक" ? chequeNo : "", date })}
           className="flex-1 h-10 bg-primary text-white rounded-xl text-sm font-semibold active:scale-[0.97] transition-transform duration-100"
         >
           Save
@@ -628,7 +749,7 @@ function DeleteConfirmModal({ onConfirm, onCancel }: { onConfirm: () => void; on
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 pt-6 pb-4 text-center">
-          <div className="font-semibold text-foreground mb-1">Delete Voucher?</div>
+          <div className="font-semibold text-foreground mb-1">Delete Receipt?</div>
           <div className="text-muted-foreground text-sm">This cannot be undone.</div>
         </div>
         <div className="border-t border-border flex">
@@ -652,14 +773,32 @@ function HistoryTab({
   onDelete: (id: number) => void;
 }) {
   const [query, setQuery] = useState("");
-  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
 
-  const filtered = [...history].reverse().filter((r) => {
+  const historyItems = [...history].reverse().reduce<{
+    key: string;
+    entries: VoucherEntry[];
+    total: number;
+    lineCount: number;
+    isGroup: boolean;
+  }[]>((items, entry) => {
+    const groupId = entry.splitGroup?.groupId;
+    const key = groupId ? `group-${groupId}` : `entry-${entry.id}`;
+    if (items.some((item) => item.key === key)) return items;
+    const entries = groupId
+      ? history.filter((candidate) => candidate.splitGroup?.groupId === groupId).sort((a, b) => (a.splitGroup?.index ?? 0) - (b.splitGroup?.index ?? 0))
+      : [entry];
+    const total = sumLineItems(entries.flatMap(normalizeLineItems));
+    const lineCount = entries.reduce((acc, receipt) => acc + normalizeLineItems(receipt).length, 0);
+    items.push({ key, entries, total, lineCount, isGroup: entries.length > 1 });
+    return items;
+  }, []).filter((item) => {
     if (!query.trim()) return true;
     const q = query.toLowerCase();
-    return r.vendor.toLowerCase().includes(q) || r.date.includes(q) || formatDisplayDate(r.date).toLowerCase().includes(q);
+    const entry = item.entries[0];
+    return entry.vendor.toLowerCase().includes(q) || entry.date.includes(q) || formatDisplayDate(entry.date).toLowerCase().includes(q);
   });
 
   function startEdit(entry: VoucherEntry) {
@@ -670,7 +809,7 @@ function HistoryTab({
   function handleDelete(id: number) {
     onDelete(id);
     setDeleteId(null);
-    if (expandedId === id) setExpandedId(null);
+    setExpandedId(null);
   }
 
   return (
@@ -679,7 +818,7 @@ function HistoryTab({
         <div className="flex items-center h-11 bg-muted rounded-xl px-3 gap-2 focus-within:ring-2 focus-within:ring-primary/40">
           <Search size={15} className="text-muted-foreground shrink-0" />
           <input
-            placeholder="Search vendor or date…"
+            placeholder="Search parivar or date…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             className="flex-1 bg-transparent outline-none text-foreground placeholder:text-muted-foreground text-sm"
@@ -693,15 +832,17 @@ function HistoryTab({
       </div>
 
       <div className="flex-1 overflow-y-auto px-5 pb-4">
-        {filtered.length === 0 && (
+        {historyItems.length === 0 && (
           <div className="text-center text-muted-foreground text-sm py-12">
-            {history.length === 0 ? "No vouchers yet" : "No results found"}
+            {history.length === 0 ? "No receipts yet" : "No results found"}
           </div>
         )}
-        {filtered.length > 0 && (
+        {historyItems.length > 0 && (
           <div className="bg-white rounded-2xl border border-border overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
-            {filtered.map((entry, i) => (
-              <div key={entry.id} className={i < filtered.length - 1 ? "border-b border-border" : ""}>
+            {historyItems.map((item, i) => {
+              const entry = item.entries[0];
+              return (
+              <div key={item.key} className={i < historyItems.length - 1 ? "border-b border-border" : ""}>
                 {editingId === entry.id ? (
                   <EditRow
                     entry={entry}
@@ -714,48 +855,74 @@ function HistoryTab({
                   <>
                     <button
                       className="w-full text-left px-4 py-4 active:bg-muted/60 transition-colors duration-100"
-                      onClick={() => setExpandedId(expandedId === entry.id ? null : entry.id)}
+                      onClick={() => setExpandedId(expandedId === item.key ? null : item.key)}
                     >
                       <div className="flex items-baseline justify-between gap-2">
                         <span className="font-semibold text-foreground text-[15px] truncate">{entry.vendor}</span>
-                        <span className="text-foreground font-medium text-sm shrink-0">₹{formatINR(entry.amount)}</span>
+                        <span className="text-foreground font-medium text-sm shrink-0">₹{formatINR(item.total)}</span>
                       </div>
                       <div className="flex items-center justify-between mt-0.5">
-                        <span className="text-muted-foreground text-xs">{directionLabel(entry.direction)} · {entry.account}</span>
+                        <span className="text-muted-foreground text-xs">
+                          {item.isGroup ? `${item.entries[0].voucherNo} to ${item.entries[item.entries.length - 1].voucherNo}` : `${item.lineCount} line item${item.lineCount === 1 ? "" : "s"}`}
+                        </span>
                         <span className="text-muted-foreground text-xs">{formatDisplayDate(entry.date)}</span>
                       </div>
                     </button>
 
-                    {expandedId === entry.id && (
-                      <div className="px-4 pb-3.5 pt-1 bg-muted/40 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-muted-foreground font-mono tracking-wide">{entry.voucherNo}</span>
-                          {entry.splitGroup && (
-                            <span className="text-[10px] font-medium text-primary bg-accent rounded-full px-2 py-0.5">
-                              Split {entry.splitGroup.index} of {entry.splitGroup.total}
-                            </span>
-                          )}
+                    {expandedId === item.key && (
+                      <div className="px-4 pb-3.5 pt-2 bg-muted/40">
+                        <div className="flex items-center justify-between text-xs text-muted-foreground">
+                          <span>{item.isGroup ? `${item.entries.length} split receipts` : entry.voucherNo}</span>
+                          <span>{entry.paymentType ?? "नगदी"}</span>
                         </div>
-                        <div className="flex gap-4">
-                          <button
-                            onClick={() => startEdit(entry)}
-                            className="flex items-center gap-1.5 text-primary text-xs font-semibold active:scale-90 transition-transform duration-100"
-                          >
-                            <Pencil size={12} /> Edit
-                          </button>
-                          <button
-                            onClick={() => setDeleteId(entry.id)}
-                            className="flex items-center gap-1.5 text-destructive text-xs font-semibold active:scale-90 transition-transform duration-100"
-                          >
-                            <Trash2 size={12} /> Delete
-                          </button>
+                        <div className="mt-2 flex flex-col gap-2">
+                          {item.entries.map((receipt) => (
+                            <div key={receipt.id} className="rounded-xl bg-white/70 overflow-hidden">
+                              <div className="flex items-center justify-between px-3 py-2 text-xs border-b border-border">
+                                <span className="font-mono text-muted-foreground">{receipt.voucherNo}</span>
+                                <span className="font-semibold text-foreground">₹{formatINR(receipt.amount)}</span>
+                              </div>
+                              {normalizeLineItems(receipt).map((line, lineIdx) => (
+                                <div key={lineIdx} className={`px-3 py-2 text-xs ${lineIdx > 0 ? "border-t border-border" : ""}`}>
+                                  <div className="flex items-center justify-between gap-3">
+                                    <span className="text-foreground font-medium truncate">{line.account}</span>
+                                    <span className="text-foreground shrink-0">₹{formatINR(line.amount)}</span>
+                                  </div>
+                                  {line.remarks && <div className="text-muted-foreground mt-0.5">{line.remarks}</div>}
+                                </div>
+                              ))}
+                            </div>
+                          ))}
                         </div>
+                        {(entry.haste || entry.remarks || entry.bankName || entry.chequeNo) && (
+                          <div className="mt-2 text-xs text-muted-foreground leading-relaxed">
+                            {entry.haste && <div>हस्ते: {entry.haste}</div>}
+                            {entry.remarks && <div>Remarks: {entry.remarks}</div>}
+                            {entry.paymentType === "चेक" && <div>Cheque: {entry.chequeNo} · {entry.bankName}</div>}
+                          </div>
+                        )}
+                        {!item.isGroup && (
+                          <div className="flex gap-4 justify-end mt-3">
+                            <button
+                              onClick={() => startEdit(entry)}
+                              className="flex items-center gap-1.5 text-primary text-xs font-semibold active:scale-90 transition-transform duration-100"
+                            >
+                              <Pencil size={12} /> Edit
+                            </button>
+                            <button
+                              onClick={() => setDeleteId(entry.id)}
+                              className="flex items-center gap-1.5 text-destructive text-xs font-semibold active:scale-90 transition-transform duration-100"
+                            >
+                              <Trash2 size={12} /> Delete
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )}
                   </>
                 )}
               </div>
-            ))}
+            )})}
           </div>
         )}
       </div>
@@ -817,20 +984,26 @@ export default function App() {
       if (!target) return prev;
       const merged: VoucherEntry = { ...target, ...patch };
 
-      if (merged.amount > threshold) {
-        const parts = computeSplit(merged.amount, threshold);
-        if (parts.length > 1) {
+      if (merged.amount > SPLIT_TRIGGER_AMOUNT) {
+        const groups = splitLineItems(normalizeLineItems(merged), threshold);
+        if (groups.length > 1) {
           const withoutTarget = prev.filter((r) => r.id !== id);
           const startNum = maxVoucherNum(prev) + 1;
-          const newEntries: VoucherEntry[] = parts.map((amt, i) => ({
+          const groupId = Date.now();
+          const newEntries: VoucherEntry[] = groups.map((lines, i) => ({
             id: Date.now() + i,
-            direction: merged.direction,
             vendor: merged.vendor,
-            amount: amt,
-            account: merged.account,
+            amount: sumLineItems(lines),
+            account: lines.map((line) => line.account).join(", "),
+            lineItems: lines,
+            haste: merged.haste,
+            remarks: merged.remarks,
+            paymentType: merged.paymentType ?? "नगदी",
+            bankName: merged.bankName,
+            chequeNo: merged.chequeNo,
             date: merged.date,
             voucherNo: voucherNoFromNum(startNum + i),
-            splitGroup: { index: i + 1, total: parts.length },
+            splitGroup: { index: i + 1, total: groups.length, groupId },
           }));
           return [...withoutTarget, ...newEntries];
         }
@@ -843,9 +1016,9 @@ export default function App() {
   const deleteVoucher = useCallback((id: number) => setHistory((p) => p.filter((r) => r.id !== id)), []);
 
   const tabTitles: Record<Tab, string> = {
-    generate: "New Voucher",
+    generate: "New Receipt",
     master: "Master Data",
-    history: "Voucher History",
+    history: "Receipt History",
   };
 
   if (!ready) {

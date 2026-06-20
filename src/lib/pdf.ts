@@ -1,17 +1,59 @@
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
+import type { PaymentType, VoucherLineItem } from "../app/types";
 
 export interface VoucherPDFEntry {
-  direction: "paid" | "received";
   vendor: string;
   amount: number;
   account: string;
+  lineItems?: VoucherLineItem[];
+  haste?: string;
+  remarks?: string;
+  paymentType?: PaymentType;
+  chequeNo?: string;
+  bankName?: string;
   date: string;
   voucherNo: string;
 }
 
-const TRUST_NAME = "श्री श्वेतांबर जैन तपागच्छ उपाश्रय ट्रस्ट";
-const TRUST_ADDRESS = "4/2 रेस कोर्स रोड, इंदौर";
+const TRUST_DATA = {
+  mangalacharana: "॥ श्री पार्श्वनाथाय नमः ॥",
+  trustName: "श्री श्वेताम्बर जैन तपागच्छ उपाश्रय ट्रस्ट",
+  office: "कार्यालय : 4/2, रेसकोर्स रोड, इन्दौर",
+};
+
+const HINDI = {
+  serial: "क्रमांक:",
+  receipt: "रसीद",
+  date: "दिनांक:",
+  shreeman: "श्रीमान:",
+  haste: "हस्ते:",
+  details: "विवरण",
+  amount: "रकम",
+  note: "टिप्पणी:",
+  total: "कुल योग",
+  amountInWords: "अक्षरी रुपये:",
+  paymentType: "भुगतान का प्रकार:",
+  cash: "नगदी",
+  cheque: "चेक",
+  online: "ऑनलाइन",
+  chequeNo: "चेक नं.",
+  bank: "बैंक:",
+  receivedWithThanks: "द्वारा सधन्यवाद प्राप्त हुए",
+  signature: "अधिकृत हस्ताक्षर",
+  generated: "यह एक स्वतः जनित रसीद है",
+};
+
+const PAYMENT_TYPES: PaymentType[] = [HINDI.cash, HINDI.cheque, HINDI.online];
+
+function escapeHTML(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
 
 function formatINR(value: number): string {
   return new Intl.NumberFormat("en-IN", {
@@ -27,54 +69,116 @@ function formatDisplayDate(iso: string): string {
   return `${parseInt(d)} ${months[parseInt(m) - 1]} ${y}`;
 }
 
-function directionLabel(direction: VoucherPDFEntry["direction"]): string {
-  return direction === "paid" ? "Paid to" : "Received from";
+function integerToWords(num: number): string {
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const belowHundred = (n: number) => n < 20 ? ones[n] : `${tens[Math.floor(n / 10)]}${n % 10 ? " " + ones[n % 10] : ""}`;
+  const belowThousand = (n: number) => {
+    const hundred = Math.floor(n / 100);
+    const rest = n % 100;
+    return `${hundred ? ones[hundred] + " Hundred" : ""}${hundred && rest ? " " : ""}${rest ? belowHundred(rest) : ""}`;
+  };
+  if (num === 0) return "Zero";
+  const parts: string[] = [];
+  const crore = Math.floor(num / 10000000);
+  num %= 10000000;
+  const lakh = Math.floor(num / 100000);
+  num %= 100000;
+  const thousand = Math.floor(num / 1000);
+  num %= 1000;
+  if (crore) parts.push(`${belowThousand(crore)} Crore`);
+  if (lakh) parts.push(`${belowThousand(lakh)} Lakh`);
+  if (thousand) parts.push(`${belowThousand(thousand)} Thousand`);
+  if (num) parts.push(belowThousand(num));
+  return parts.join(" ");
+}
+
+function amountInWords(amount: number): string {
+  const rupees = Math.floor(amount);
+  const paise = Math.round((amount - rupees) * 100);
+  return `Rupees ${integerToWords(rupees)}${paise ? ` and ${integerToWords(paise)} Paise` : ""} Only`;
+}
+
+function dottedLine(label: string, value = "", wide = true): string {
+  return `
+    <div style="display:flex;align-items:baseline;gap:4px;${wide ? "flex:1;" : ""}">
+      <span style="font-size:13px;font-weight:500;color:#1a2e5a;white-space:nowrap;">${label}</span>
+      <span style="flex:1;border-bottom:1px dotted #1a2e5a;min-width:40px;font-size:13px;color:#1a2e5a;padding:0 4px 1px;">${escapeHTML(value)}</span>
+    </div>`;
+}
+
+function radioDot(selected: boolean): string {
+  return `
+    <span style="width:14px;height:14px;border-radius:999px;border:1px solid #1a2e5a;display:inline-flex;align-items:center;justify-content:center;background:${selected ? "#1a2e5a" : "white"};">
+      ${selected ? '<span style="width:6px;height:6px;border-radius:999px;background:white;display:block;"></span>' : ""}
+    </span>`;
 }
 
 function buildVoucherHTML(entry: VoucherPDFEntry): string {
-  const rows = [
-    [directionLabel(entry.direction), entry.vendor],
-    ["Amount", `Rs. ${formatINR(entry.amount)}`],
-    ["Account", entry.account],
-  ];
-
-  const rowsHTML = rows
-    .map(
-      ([label, value]) => `
-      <div style="display:flex;justify-content:space-between;align-items:baseline;padding:10px 0;border-bottom:1px solid #f0f0f0;">
-        <span style="color:#555;font-size:13px;">${label}</span>
-        <span style="color:#1c1c1e;font-size:13px;text-align:right;max-width:60%;">${value}</span>
-      </div>`
-    )
-    .join("");
+  const lineItems = entry.lineItems?.length ? entry.lineItems : [{ account: entry.account, amount: entry.amount, remarks: entry.remarks }];
+  const paymentType = entry.paymentType ?? HINDI.cash;
+  const rowsHTML = lineItems.map((line, idx) => `
+    <div style="display:grid;grid-template-columns:1fr 160px;${idx > 0 ? "border-top:1px solid rgba(26,46,90,0.15);" : ""}">
+      <div style="padding:10px 16px;">
+        <p style="font-size:13px;color:#1a2e5a;font-weight:500;margin:0;">${escapeHTML(line.account)}</p>
+        ${line.remarks ? `<p style="font-size:11px;color:rgba(26,46,90,0.55);margin:2px 0 0;font-style:italic;">${HINDI.note} ${escapeHTML(line.remarks)}</p>` : ""}
+      </div>
+      <div style="padding:10px 16px;text-align:right;border-left:1px solid rgba(26,46,90,0.2);">
+        <span style="font-size:13px;font-weight:600;color:#1a2e5a;">Rs. ${formatINR(line.amount)}</span>
+      </div>
+    </div>`).join("");
 
   return `
-    <div style="
-      width:794px;
-      min-height:400px;
-      padding:40px 56px;
-      font-family:'Noto Sans Devanagari','Noto Sans',Arial,sans-serif;
-      background:#fff;
-      box-sizing:border-box;
-      color:#1c1c1e;
-    ">
-      <div style="font-size:18px;font-weight:600;margin-bottom:4px;">${TRUST_NAME}</div>
-      <div style="font-size:13px;color:#555;margin-bottom:16px;">${TRUST_ADDRESS}</div>
-      <hr style="border:none;border-top:1px solid #dcdcdc;margin-bottom:16px;" />
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
-        <span style="font-size:20px;font-weight:700;letter-spacing:0.5px;">PAYMENT VOUCHER</span>
-        <span style="font-size:12px;color:#555;">${entry.voucherNo}</span>
-      </div>
-      <div style="font-size:13px;color:#1c1c1e;margin-bottom:16px;">Date: ${formatDisplayDate(entry.date)}</div>
-      <hr style="border:none;border-top:1px solid #dcdcdc;margin-bottom:8px;" />
-      ${rowsHTML}
-      <div style="margin-top:48px;display:flex;justify-content:flex-end;">
-        <div style="text-align:center;min-width:160px;">
-          <div style="border-top:1px solid #1c1c1e;padding-top:8px;font-size:11px;color:#555;">Authorised Signatory</div>
+    <div style="width:680px;background:white;border:1px solid rgba(26,46,90,0.2);border-radius:2px;overflow:hidden;font-family:'Noto Sans Devanagari','Noto Sans',Arial,sans-serif;color:#1a2e5a;box-sizing:border-box;">
+      <div style="height:6px;background:linear-gradient(to right,#1a2e5a,#c8902a,#1a2e5a);"></div>
+      <div style="padding:20px 32px 28px;">
+        <div style="text-align:center;margin-bottom:12px;">
+          <p style="font-size:11px;letter-spacing:3px;margin:0 0 4px;color:#1a2e5a;">${TRUST_DATA.mangalacharana}</p>
+          <h1 style="font-size:22px;font-weight:700;line-height:1.25;margin:0;color:#1a2e5a;">${TRUST_DATA.trustName}</h1>
+          <p style="font-size:12px;color:rgba(26,46,90,0.8);margin:4px 0 0;">${TRUST_DATA.office}</p>
         </div>
+        <div style="border-top:2px solid #1a2e5a;margin-top:12px;margin-bottom:2px;"></div>
+        <div style="border-top:1px solid rgba(26,46,90,0.4);margin-bottom:16px;"></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+          <div><span style="font-size:12px;color:rgba(26,46,90,0.7);">${HINDI.serial}</span> <span style="font-size:15px;font-weight:700;letter-spacing:1px;">${escapeHTML(entry.voucherNo)}</span></div>
+          <div style="border:2px solid #1a2e5a;padding:4px 24px;border-radius:2px;"><span style="font-size:16px;font-weight:700;letter-spacing:3px;">${HINDI.receipt}</span></div>
+          <div><span style="font-size:12px;color:rgba(26,46,90,0.7);">${HINDI.date}</span> <span style="font-size:13px;font-weight:600;">${formatDisplayDate(entry.date)}</span></div>
+        </div>
+        <div style="display:flex;gap:16px;margin-bottom:20px;">
+          ${dottedLine(HINDI.shreeman, entry.vendor)}
+          ${entry.haste?.trim() ? dottedLine(HINDI.haste, entry.haste) : ""}
+        </div>
+        <div style="border:1px solid #1a2e5a;border-radius:2px;overflow:hidden;margin-bottom:16px;">
+          <div style="display:grid;grid-template-columns:1fr 160px;background:#1a2e5a;">
+            <div style="padding:6px 16px;text-align:center;"><span style="font-size:12px;font-weight:600;color:white;letter-spacing:0.5px;">${HINDI.details}</span></div>
+            <div style="padding:6px 16px;text-align:center;border-left:1px solid rgba(255,255,255,0.3);"><span style="font-size:12px;font-weight:600;color:white;letter-spacing:0.5px;">${HINDI.amount}</span></div>
+          </div>
+          ${rowsHTML}
+          <div style="display:grid;grid-template-columns:1fr 160px;border-top:1px solid rgba(26,46,90,0.3);background:#f7f4ef;">
+            <div style="padding:8px 16px;text-align:right;"><span style="font-size:12px;font-weight:600;">${HINDI.total}</span></div>
+            <div style="padding:8px 16px;text-align:right;border-left:1px solid rgba(26,46,90,0.2);"><span style="font-size:13px;font-weight:700;">Rs. ${formatINR(entry.amount)}</span></div>
+          </div>
+        </div>
+        ${entry.remarks?.trim() ? `<div style="margin-bottom:14px;">${dottedLine(HINDI.note, entry.remarks)}</div>` : ""}
+        <div style="margin-bottom:16px;display:flex;align-items:baseline;gap:6px;">
+          <span style="font-size:12px;color:rgba(26,46,90,0.7);white-space:nowrap;">${HINDI.amountInWords}</span>
+          <span style="flex:1;font-size:12px;font-style:italic;color:#1a2e5a;padding:0 4px 1px;border-bottom:1px dotted rgba(26,46,90,0.5);">${amountInWords(entry.amount)}</span>
+        </div>
+        <div style="margin-bottom:8px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 20px;">
+          <span style="font-size:12px;color:rgba(26,46,90,0.7);white-space:nowrap;">${HINDI.paymentType}</span>
+          ${PAYMENT_TYPES.map((type) => `<span style="display:flex;align-items:center;gap:6px;">${radioDot(paymentType === type)}<span style="font-size:12px;">${type}</span></span>`).join("")}
+        </div>
+        ${paymentType === HINDI.cheque ? `<div style="display:flex;gap:20px;margin-bottom:16px;padding-top:4px;">${dottedLine(HINDI.chequeNo, entry.chequeNo)}${dottedLine(HINDI.bank, entry.bankName)}</div>` : '<div style="margin-bottom:16px;"></div>'}
+        <div style="border-top:1px solid rgba(26,46,90,0.4);margin-bottom:2px;"></div>
+        <div style="border-top:2px solid #1a2e5a;margin-bottom:16px;"></div>
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px;">
+          <span style="font-size:13px;font-weight:500;">${HINDI.receivedWithThanks}</span>
+          <div style="text-align:right;"><div style="height:32px;width:128px;margin-bottom:2px;border-bottom:1px dotted rgba(26,46,90,0.5);"></div><span style="font-size:10px;color:rgba(26,46,90,0.6);">${HINDI.signature}</span></div>
+        </div>
+        <p style="text-align:center;font-size:10px;color:rgba(26,46,90,0.45);font-style:italic;margin:0;">${HINDI.generated}</p>
       </div>
-    </div>
-  `;
+      <div style="height:6px;background:linear-gradient(to right,#1a2e5a,#c8902a,#1a2e5a);"></div>
+    </div>`;
 }
 
 async function renderVoucherToCanvas(entry: VoucherPDFEntry): Promise<HTMLCanvasElement> {
@@ -82,19 +186,16 @@ async function renderVoucherToCanvas(entry: VoucherPDFEntry): Promise<HTMLCanvas
   container.style.position = "fixed";
   container.style.left = "-9999px";
   container.style.top = "0";
-  container.style.width = "794px";
+  container.style.width = "680px";
   container.innerHTML = buildVoucherHTML(entry);
   document.body.appendChild(container);
-
   await document.fonts.ready;
-
   const canvas = await html2canvas(container, {
     scale: 2,
     useCORS: true,
     backgroundColor: "#ffffff",
-    width: 794,
+    width: 680,
   });
-
   document.body.removeChild(container);
   return canvas;
 }
@@ -103,28 +204,23 @@ async function buildVoucherPDF(entries: VoucherPDFEntry[]): Promise<Blob> {
   const doc = new jsPDF({ unit: "mm", format: "a4" });
   const pageW = 210;
   const pageH = 297;
-
   for (let i = 0; i < entries.length; i++) {
     if (i > 0) doc.addPage();
     const canvas = await renderVoucherToCanvas(entries[i]);
     const imgData = canvas.toDataURL("image/png");
-    const canvasAspect = canvas.height / canvas.width;
-    const imgW = pageW;
-    const imgH = imgW * canvasAspect;
-    doc.addImage(imgData, "PNG", 0, 0, imgW, Math.min(imgH, pageH));
+    const imgW = 180;
+    const imgH = imgW * (canvas.height / canvas.width);
+    doc.addImage(imgData, "PNG", (pageW - imgW) / 2, 12, imgW, Math.min(imgH, pageH - 24));
   }
-
   return doc.output("blob");
 }
 
 async function shareOrDownload(blob: Blob, filename: string) {
   const file = new File([blob], filename, { type: "application/pdf" });
-
   if (navigator.canShare?.({ files: [file] })) {
     await navigator.share({ files: [file], title: filename });
     return;
   }
-
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -138,7 +234,6 @@ export async function openVoucherPDF(entries: VoucherPDFEntry[]) {
   const filename =
     entries.length === 1
       ? `${entries[0].voucherNo}.pdf`
-      : `vouchers-${entries[0].voucherNo}-to-${entries[entries.length - 1].voucherNo}.pdf`;
-
+      : `receipts-${entries[0].voucherNo}-to-${entries[entries.length - 1].voucherNo}.pdf`;
   await shareOrDownload(blob, filename);
 }
