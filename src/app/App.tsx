@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, ChevronDown, Settings as SettingsIcon } from "lucide-react";
+import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, ChevronDown, Settings as SettingsIcon, Download, RefreshCw } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { initAppData, setItem } from "../lib/db";
-import { openVoucherPDF } from "../lib/pdf";
+import { openVoucherPDF, voucherEntryToPDFEntry } from "../lib/pdf";
 import type { PaymentType, Tab, VoucherEntry, VoucherLineItem } from "./types";
 import { DEFAULT_SPLIT_THRESHOLD, SPLIT_TRIGGER_AMOUNT } from "./types";
 
@@ -95,6 +95,29 @@ function handleAmountInput(raw: string): string {
   const intPart = parts[0];
   const decPart = parts.length > 1 ? parts[1] : null;
   return formatIndianInteger(intPart) + (decPart !== null ? "." + decPart : "");
+}
+
+/** Generates (or regenerates) the PDF for a set of already-saved entries.
+ *  Used both right after creating a receipt and from the Regenerate buttons in History,
+ *  so retrying a failed PDF never re-saves or duplicates anything — it only re-renders. */
+async function regenerateVoucherPDF(entries: VoucherEntry[]): Promise<void> {
+  if (!entries.length) return;
+  try {
+    const { failed } = await openVoucherPDF(entries.map(voucherEntryToPDFEntry));
+    if (failed.length === 0) {
+      toast.success(entries.length > 1 ? `${entries.length} receipts generated` : `Receipt ${entries[0].voucherNo} generated`);
+    } else {
+      toast.warning(
+        `${entries.length - failed.length} of ${entries.length} receipts generated. Missing: ${failed.map((f) => f.voucherNo).join(", ")}`,
+        { action: { label: "Retry", onClick: () => { void regenerateVoucherPDF(entries); } } },
+      );
+    }
+  } catch (err) {
+    console.error("Voucher PDF generation failed", err);
+    toast.error("Could not create the PDF. Your receipt is safely saved — try again anytime.", {
+      action: { label: "Retry", onClick: () => { void regenerateVoucherPDF(entries); } },
+    });
+  }
 }
 
 // ── SearchableDropdown ─────────────────────────────────────────────────────
@@ -370,14 +393,7 @@ function GenerateTab({
   async function finalize(groups: VoucherLineItem[][]) {
     const entries = buildEntries(groups);
     onSaveMany(entries);
-    try {
-      await openVoucherPDF(entries);
-      toast.success(
-        entries.length > 1 ? `${entries.length} receipts generated` : `Receipt ${entries[0].voucherNo} generated`,
-      );
-    } catch {
-      toast.error("Voucher saved, but PDF could not be created");
-    }
+    await regenerateVoucherPDF(entries);
     resetForm();
   }
 
@@ -776,6 +792,16 @@ function HistoryTab({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
+  const [regeneratingKey, setRegeneratingKey] = useState<string | null>(null);
+
+  async function handleRegenerate(key: string, entries: VoucherEntry[]) {
+    setRegeneratingKey(key);
+    try {
+      await regenerateVoucherPDF(entries);
+    } finally {
+      setRegeneratingKey(null);
+    }
+  }
 
   const historyItems = [...history].reverse().reduce<{
     key: string;
@@ -875,12 +901,32 @@ function HistoryTab({
                           <span>{item.isGroup ? `${item.entries.length} split receipts` : entry.voucherNo}</span>
                           <span>{entry.paymentType ?? "नगदी"}</span>
                         </div>
+                        {item.isGroup && (
+                          <button
+                            onClick={() => handleRegenerate(item.key, item.entries)}
+                            disabled={regeneratingKey === item.key}
+                            className="mt-2 w-full h-9 rounded-xl bg-primary/10 text-primary text-xs font-semibold flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform duration-100 disabled:opacity-50"
+                          >
+                            <RefreshCw size={12} className={regeneratingKey === item.key ? "animate-spin" : ""} />
+                            {regeneratingKey === item.key ? "Generating…" : `Regenerate all ${item.entries.length} PDFs`}
+                          </button>
+                        )}
                         <div className="mt-2 flex flex-col gap-2">
                           {item.entries.map((receipt) => (
                             <div key={receipt.id} className="rounded-xl bg-white/70 overflow-hidden">
                               <div className="flex items-center justify-between px-3 py-2 text-xs border-b border-border">
                                 <span className="font-mono text-muted-foreground">{receipt.voucherNo}</span>
-                                <span className="font-semibold text-foreground">₹{formatINR(receipt.amount)}</span>
+                                <div className="flex items-center gap-3">
+                                  <span className="font-semibold text-foreground">₹{formatINR(receipt.amount)}</span>
+                                  <button
+                                    onClick={() => handleRegenerate(`receipt-${receipt.id}`, [receipt])}
+                                    disabled={regeneratingKey === `receipt-${receipt.id}`}
+                                    className="text-primary active:scale-90 transition-transform duration-100 disabled:opacity-40"
+                                    aria-label={`Regenerate PDF for ${receipt.voucherNo}`}
+                                  >
+                                    <Download size={12} />
+                                  </button>
+                                </div>
                               </div>
                               {normalizeLineItems(receipt).map((line, lineIdx) => (
                                 <div key={lineIdx} className={`px-3 py-2 text-xs ${lineIdx > 0 ? "border-t border-border" : ""}`}>
@@ -903,6 +949,13 @@ function HistoryTab({
                         )}
                         {!item.isGroup && (
                           <div className="flex gap-4 justify-end mt-3">
+                            <button
+                              onClick={() => handleRegenerate(`entry-${entry.id}`, [entry])}
+                              disabled={regeneratingKey === `entry-${entry.id}`}
+                              className="flex items-center gap-1.5 text-primary text-xs font-semibold active:scale-90 transition-transform duration-100 disabled:opacity-40"
+                            >
+                              <Download size={12} /> {regeneratingKey === `entry-${entry.id}` ? "Generating…" : "Regenerate"}
+                            </button>
                             <button
                               onClick={() => startEdit(entry)}
                               className="flex items-center gap-1.5 text-primary text-xs font-semibold active:scale-90 transition-transform duration-100"
