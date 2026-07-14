@@ -3,6 +3,11 @@ import { Receipt, Database, Clock, Plus, Trash2, Pencil, Check, X, Search, Chevr
 import { Toaster, toast } from "sonner";
 import { initAppData, setItem } from "../lib/db";
 import { openVoucherPDF, voucherEntryToPDFEntry } from "../lib/pdf";
+import { ensureSignedIn } from "../lib/firebase";
+import { addMasterData, deleteMasterData, editMasterData, subscribeMasterData } from "../lib/masterDataSync";
+import { deleteVoucher as deleteRemoteVoucher, subscribeOwnVouchers, upsertVoucher } from "../lib/voucherSync";
+import SeriesSetup from "./SeriesSetup";
+import Admin from "./Admin";
 import type { PaymentType, Tab, VoucherEntry, VoucherLineItem } from "./types";
 import { DEFAULT_SPLIT_THRESHOLD, SPLIT_TRIGGER_AMOUNT } from "./types";
 
@@ -39,15 +44,16 @@ function formatDisplayDate(iso: string): string {
   return `${parseInt(d)} ${months[parseInt(m) - 1]} ${y}`;
 }
 
-function maxVoucherNum(history: VoucherEntry[]): number {
+function maxVoucherNum(history: VoucherEntry[], series: string): number {
   return history.reduce((acc, r) => {
-    const n = parseInt(r.voucherNo.replace(/^(VCH|RCP)-/, "")) || 0;
+    if (r.series !== series && !r.voucherNo.startsWith(`${series}-`)) return acc;
+    const n = parseInt(r.voucherNo.split("-").pop() ?? "0") || 0;
     return Math.max(acc, n);
   }, 0);
 }
 
-function voucherNoFromNum(n: number): string {
-  return "RCP-" + String(n).padStart(4, "0");
+function voucherNoFromNum(n: number, series: string): string {
+  return `${series}-${String(n).padStart(4, "0")}`;
 }
 
 function normalizeLineItems(entry: VoucherEntry): VoucherLineItem[] {
@@ -233,14 +239,19 @@ function PaymentTypeToggle({ value, onChange }: { value: PaymentType; onChange: 
 function SplitConfirmModal({
   groups,
   startNum,
+  series,
+  initialHaste,
   onConfirm,
   onCancel,
 }: {
   groups: VoucherLineItem[][];
   startNum: number;
-  onConfirm: () => void;
+  series: string;
+  initialHaste: string;
+  onConfirm: (hasteByGroup: string[]) => void;
   onCancel: () => void;
 }) {
+  const [hasteByGroup, setHasteByGroup] = useState(() => groups.map(() => initialHaste));
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/30 backdrop-blur-[2px]" onClick={onCancel}>
       <div
@@ -261,19 +272,20 @@ function SplitConfirmModal({
                 className={`px-4 py-3 text-sm ${i < groups.length - 1 ? "border-b border-border" : ""}`}
               >
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-foreground font-medium">{voucherNoFromNum(startNum + i)}</span>
+                  <span className="text-foreground font-medium">{voucherNoFromNum(startNum + i, series)}</span>
                   <span className="text-foreground">₹{formatINR(amt)}</span>
                 </div>
                 <div className="text-muted-foreground text-xs mt-1 leading-relaxed">
                   {lines.map((line) => `₹${formatINR(line.amount)} from ${line.account}`).join(" · ")}
                 </div>
+                <input value={hasteByGroup[i]} onChange={(e) => setHasteByGroup((values) => values.map((value, index) => index === i ? e.target.value : value))} placeholder="Haste" className="mt-2 h-9 w-full rounded-lg bg-white px-2 text-sm outline-none" />
               </div>
             )})}
           </div>
         </div>
         <div className="border-t border-border flex">
           <button onClick={onCancel} className="flex-1 h-12 text-foreground font-medium border-r border-border active:bg-muted transition-colors">Cancel</button>
-          <button onClick={onConfirm} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Confirm & Generate All</button>
+          <button onClick={() => onConfirm(hasteByGroup)} className="flex-1 h-12 text-primary font-semibold active:bg-muted transition-colors">Confirm & Generate All</button>
         </div>
       </div>
     </div>
@@ -285,10 +297,12 @@ function SplitConfirmModal({
 function SettingsModal({
   threshold,
   onSave,
+  onAdmin,
   onCancel,
 }: {
   threshold: number;
   onSave: (v: number) => void;
+  onAdmin: () => void;
   onCancel: () => void;
 }) {
   const [val, setVal] = useState(String(threshold));
@@ -318,6 +332,7 @@ function SettingsModal({
               className="flex-1 bg-transparent outline-none text-foreground text-base"
             />
           </div>
+          <button onClick={onAdmin} className="mt-4 w-full h-11 rounded-xl border border-border text-sm font-semibold text-primary">Admin</button>
         </div>
         <div className="border-t border-border flex">
           <button onClick={onCancel} className="flex-1 h-12 text-foreground font-medium border-r border-border active:bg-muted transition-colors">Cancel</button>
@@ -337,6 +352,7 @@ function GenerateTab({
   onAddAccount,
   history,
   threshold,
+  series,
   onSaveMany,
 }: {
   vendors: string[];
@@ -345,6 +361,7 @@ function GenerateTab({
   onAddAccount: (v: string) => void;
   history: VoucherEntry[];
   threshold: number;
+  series: string;
   onSaveMany: (entries: VoucherEntry[]) => void;
 }) {
   const [vendor, setVendor] = useState("");
@@ -359,8 +376,8 @@ function GenerateTab({
   const dateInputRef = useRef<HTMLInputElement>(null);
   const totalAmount = sumLineItems(lineRows.map((line) => ({ account: line.account, amount: amountToNumber(line.amountRaw), remarks: line.remarks })));
 
-  function buildEntries(groups: VoucherLineItem[][]): VoucherEntry[] {
-    const startNum = maxVoucherNum(history) + 1;
+  function buildEntries(groups: VoucherLineItem[][], hasteByGroup?: string[]): VoucherEntry[] {
+    const startNum = maxVoucherNum(history, series) + 1;
     const groupId = groups.length > 1 ? Date.now() : undefined;
     return groups.map((lines, i) => ({
       id: Date.now() + i,
@@ -368,13 +385,14 @@ function GenerateTab({
       amount: sumLineItems(lines),
       account: lines.map((line) => line.account).join(", "),
       lineItems: lines,
-      haste,
+      haste: hasteByGroup?.[i] ?? haste,
       remarks,
       paymentType,
       bankName: paymentType === "चेक" ? bankName : "",
       chequeNo: paymentType === "चेक" ? chequeNo : "",
       date,
-      voucherNo: voucherNoFromNum(startNum + i),
+      voucherNo: voucherNoFromNum(startNum + i, series),
+      series,
       ...(groups.length > 1 ? { splitGroup: { index: i + 1, total: groups.length, groupId } } : {}),
     }));
   }
@@ -390,8 +408,8 @@ function GenerateTab({
     setDate(todayISO());
   }
 
-  async function finalize(groups: VoucherLineItem[][]) {
-    const entries = buildEntries(groups);
+  async function finalize(groups: VoucherLineItem[][], hasteByGroup?: string[]) {
+    const entries = buildEntries(groups, hasteByGroup);
     onSaveMany(entries);
     await regenerateVoucherPDF(entries);
     resetForm();
@@ -419,7 +437,7 @@ function GenerateTab({
     const groups = totalAmount > SPLIT_TRIGGER_AMOUNT ? splitLineItems(lines, threshold) : [lines];
 
     if (groups.length > 1) {
-      setPendingSplit({ groups, startNum: maxVoucherNum(history) + 1 });
+      setPendingSplit({ groups, startNum: maxVoucherNum(history, series) + 1 });
     } else {
       finalize(groups);
     }
@@ -553,7 +571,9 @@ function GenerateTab({
         <SplitConfirmModal
           groups={pendingSplit.groups}
           startNum={pendingSplit.startNum}
-          onConfirm={() => { finalize(pendingSplit.groups); setPendingSplit(null); }}
+          series={series}
+          initialHaste={haste}
+          onConfirm={(hasteByGroup) => { void finalize(pendingSplit.groups, hasteByGroup); setPendingSplit(null); }}
           onCancel={() => setPendingSplit(null)}
         />
       )}
@@ -994,44 +1014,49 @@ function HistoryTab({
 
 export default function App() {
   const [ready, setReady] = useState(false);
+  const [ownerId, setOwnerId] = useState("");
+  const [series, setSeries] = useState(() => localStorage.getItem("voucher-series") ?? "");
   const [activeTab, setActiveTab] = useState<Tab>("generate");
   const [vendors, setVendors] = useState<string[]>([]);
   const [accounts, setAccounts] = useState<string[]>([]);
+  const vendorIds = useRef<string[]>([]);
+  const accountIds = useRef<string[]>([]);
   const [history, setHistory] = useState<VoucherEntry[]>([]);
   const [threshold, setThreshold] = useState<number>(DEFAULT_SPLIT_THRESHOLD);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [adminOpen, setAdminOpen] = useState(false);
 
   useEffect(() => {
-    initAppData()
-      .then((data) => {
-        setVendors(data.vendors);
-        setAccounts(data.accounts);
-        setHistory(data.vouchers);
-        setThreshold(data.splitThreshold);
-        setReady(true);
-      })
+    Promise.all([initAppData(), ensureSignedIn()])
+      .then(([data, user]) => { setOwnerId(user.uid); setThreshold(data.splitThreshold); setReady(true); })
       .catch(() => {
-        toast.error("Failed to load saved data");
+        toast.error("Failed to connect to Firebase");
         setReady(true);
       });
   }, []);
 
-  useEffect(() => { if (ready) setItem("vendors", vendors); }, [ready, vendors]);
-  useEffect(() => { if (ready) setItem("accounts", accounts); }, [ready, accounts]);
-  useEffect(() => { if (ready) setItem("vouchers", history); }, [ready, history]);
   useEffect(() => { if (ready) setItem("splitThreshold", threshold); }, [ready, threshold]);
+  useEffect(() => {
+    if (!ownerId) return;
+    const stopVendors = subscribeMasterData("vendors", (items) => { vendorIds.current = items.map((item) => item.id); setVendors(items.map((item) => item.name)); });
+    const stopAccounts = subscribeMasterData("accounts", (items) => { accountIds.current = items.map((item) => item.id); setAccounts(items.map((item) => item.name)); });
+    return () => { stopVendors(); stopAccounts(); };
+  }, [ownerId]);
+  useEffect(() => ownerId && series ? subscribeOwnVouchers(ownerId, setHistory) : undefined, [ownerId, series]);
 
-  const addVendor = useCallback((v: string) => setVendors((p) => p.includes(v) ? p : [...p, v]), []);
-  const editVendor = useCallback((i: number, v: string) => setVendors((p) => p.map((x, idx) => idx === i ? v : x)), []);
-  const deleteVendor = useCallback((i: number) => setVendors((p) => p.filter((_, idx) => idx !== i)), []);
+  const addVendor = useCallback((v: string) => { if (!vendors.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("vendors", v); }, [vendors]);
+  const editVendor = useCallback((i: number, v: string) => { if (vendorIds.current[i]) void editMasterData("vendors", vendorIds.current[i], v); }, []);
+  const deleteVendor = useCallback((i: number) => { if (vendorIds.current[i]) void deleteMasterData("vendors", vendorIds.current[i]); }, []);
 
-  const addAccount = useCallback((v: string) => setAccounts((p) => p.includes(v) ? p : [...p, v]), []);
-  const editAccount = useCallback((i: number, v: string) => setAccounts((p) => p.map((x, idx) => idx === i ? v : x)), []);
-  const deleteAccount = useCallback((i: number) => setAccounts((p) => p.filter((_, idx) => idx !== i)), []);
+  const addAccount = useCallback((v: string) => { if (!accounts.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("accounts", v); }, [accounts]);
+  const editAccount = useCallback((i: number, v: string) => { if (accountIds.current[i]) void editMasterData("accounts", accountIds.current[i], v); }, []);
+  const deleteAccount = useCallback((i: number) => { if (accountIds.current[i]) void deleteMasterData("accounts", accountIds.current[i]); }, []);
 
-  const saveVouchers = useCallback((entries: VoucherEntry[]) => setHistory((p) => [...p, ...entries]), []);
+  const saveVouchers = useCallback((entries: VoucherEntry[]) => { if (ownerId && series) entries.forEach((entry) => void upsertVoucher(entry, ownerId, series)); }, [ownerId, series]);
 
   const editVoucher = useCallback((id: number, patch: Partial<VoucherEntry>) => {
+    const remoteTarget = history.find((entry) => entry.id === id);
+    if (remoteTarget && ownerId && series) void upsertVoucher({ ...remoteTarget, ...patch }, ownerId, series);
     setHistory((prev) => {
       const target = prev.find((r) => r.id === id);
       if (!target) return prev;
@@ -1041,7 +1066,7 @@ export default function App() {
         const groups = splitLineItems(normalizeLineItems(merged), threshold);
         if (groups.length > 1) {
           const withoutTarget = prev.filter((r) => r.id !== id);
-          const startNum = maxVoucherNum(prev) + 1;
+          const startNum = maxVoucherNum(prev, series) + 1;
           const groupId = Date.now();
           const newEntries: VoucherEntry[] = groups.map((lines, i) => ({
             id: Date.now() + i,
@@ -1055,7 +1080,7 @@ export default function App() {
             bankName: merged.bankName,
             chequeNo: merged.chequeNo,
             date: merged.date,
-            voucherNo: voucherNoFromNum(startNum + i),
+            voucherNo: voucherNoFromNum(startNum + i, series),
             splitGroup: { index: i + 1, total: groups.length, groupId },
           }));
           return [...withoutTarget, ...newEntries];
@@ -1064,9 +1089,13 @@ export default function App() {
 
       return prev.map((r) => (r.id === id ? merged : r));
     });
-  }, [threshold]);
+  }, [history, ownerId, series, threshold]);
 
-  const deleteVoucher = useCallback((id: number) => setHistory((p) => p.filter((r) => r.id !== id)), []);
+  const deleteVoucher = useCallback((id: number) => {
+    const entry = history.find((item) => item.id === id);
+    if (entry) void deleteRemoteVoucher(entry);
+    setHistory((p) => p.filter((r) => r.id !== id));
+  }, [history]);
 
   const tabTitles: Record<Tab, string> = {
     generate: "New Receipt",
@@ -1081,6 +1110,7 @@ export default function App() {
       </div>
     );
   }
+  if (!series) return <SeriesSetup ownerId={ownerId} onComplete={setSeries} />;
 
   return (
     <div className="flex flex-col h-full bg-background max-w-md mx-auto relative overflow-hidden">
@@ -1108,6 +1138,7 @@ export default function App() {
               onAddAccount={addAccount}
               history={history}
               threshold={threshold}
+              series={series}
               onSaveMany={saveVouchers}
             />
           </div>
@@ -1166,9 +1197,11 @@ export default function App() {
         <SettingsModal
           threshold={threshold}
           onSave={(v) => { setThreshold(v); setSettingsOpen(false); }}
+          onAdmin={() => { setSettingsOpen(false); setAdminOpen(true); }}
           onCancel={() => setSettingsOpen(false)}
         />
       )}
+      {adminOpen && <Admin onClose={() => setAdminOpen(false)} />}
     </div>
   );
 }
