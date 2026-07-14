@@ -1,5 +1,5 @@
 import {
-  collection, deleteDoc, doc, onSnapshot, orderBy, query, serverTimestamp,
+  collection, deleteDoc, doc, onSnapshot, query, serverTimestamp,
   setDoc, where, type Unsubscribe,
 } from "firebase/firestore";
 import type { VoucherEntry } from "../app/types";
@@ -11,14 +11,14 @@ function toVoucher(id: string, data: Record<string, unknown>): VoucherEntry {
   return { ...(data as VoucherEntry), id: typeof data.id === "number" ? data.id : Date.now(), voucherNo: String(data.voucherNo ?? id) };
 }
 
-export function subscribeOwnVouchers(ownerId: string, callback: (entries: VoucherEntry[]) => void): Unsubscribe {
-  return onSnapshot(query(vouchers, where("ownerId", "==", ownerId), orderBy("date", "asc")),
-    (snapshot) => callback(snapshot.docs.map((item) => toVoucher(item.id, item.data()))));
+export function subscribeOwnVouchers(ownerId: string, callback: (entries: VoucherEntry[]) => void, onError?: (error: Error) => void): Unsubscribe {
+  return onSnapshot(query(vouchers, where("ownerId", "==", ownerId)),
+    (snapshot) => callback(snapshot.docs.map((item) => toVoucher(item.id, item.data())).sort((a, b) => a.date.localeCompare(b.date))), onError);
 }
 
-export function subscribeAllVouchers(callback: (entries: VoucherEntry[]) => void): Unsubscribe {
-  return onSnapshot(query(vouchers, orderBy("date", "desc")),
-    (snapshot) => callback(snapshot.docs.map((item) => toVoucher(item.id, item.data()))));
+export function subscribeAllVouchers(callback: (entries: VoucherEntry[]) => void, onError?: (error: Error) => void): Unsubscribe {
+  return onSnapshot(vouchers,
+    (snapshot) => callback(snapshot.docs.map((item) => toVoucher(item.id, item.data())).sort((a, b) => b.date.localeCompare(a.date))), onError);
 }
 
 export async function upsertVoucher(entry: VoucherEntry, ownerId: string, series: string): Promise<void> {

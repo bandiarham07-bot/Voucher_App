@@ -1038,21 +1038,29 @@ export default function App() {
   useEffect(() => { if (ready) setItem("splitThreshold", threshold); }, [ready, threshold]);
   useEffect(() => {
     if (!ownerId) return;
-    const stopVendors = subscribeMasterData("vendors", (items) => { vendorIds.current = items.map((item) => item.id); setVendors(items.map((item) => item.name)); });
-    const stopAccounts = subscribeMasterData("accounts", (items) => { accountIds.current = items.map((item) => item.id); setAccounts(items.map((item) => item.name)); });
+    const reportSyncError = () => toast.error("Could not load shared master data. Check Firebase rules and your connection.");
+    const stopVendors = subscribeMasterData("vendors", (items) => { vendorIds.current = items.map((item) => item.id); setVendors(items.map((item) => item.name)); }, reportSyncError);
+    const stopAccounts = subscribeMasterData("accounts", (items) => { accountIds.current = items.map((item) => item.id); setAccounts(items.map((item) => item.name)); }, reportSyncError);
     return () => { stopVendors(); stopAccounts(); };
   }, [ownerId]);
-  useEffect(() => ownerId && series ? subscribeOwnVouchers(ownerId, setHistory) : undefined, [ownerId, series]);
+  useEffect(() => ownerId && series ? subscribeOwnVouchers(ownerId, setHistory, () => toast.error("Could not load voucher history. Check Firebase rules and your connection.")) : undefined, [ownerId, series]);
 
-  const addVendor = useCallback((v: string) => { if (!vendors.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("vendors", v); }, [vendors]);
-  const editVendor = useCallback((i: number, v: string) => { if (vendorIds.current[i]) void editMasterData("vendors", vendorIds.current[i], v); }, []);
-  const deleteVendor = useCallback((i: number) => { if (vendorIds.current[i]) void deleteMasterData("vendors", vendorIds.current[i]); }, []);
+  const addVendor = useCallback((v: string) => { if (!vendors.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("vendors", v).catch(() => toast.error("Could not save parivar")); }, [vendors]);
+  const editVendor = useCallback((i: number, v: string) => { if (vendorIds.current[i]) void editMasterData("vendors", vendorIds.current[i], v).catch(() => toast.error("Could not update parivar")); }, []);
+  const deleteVendor = useCallback((i: number) => { if (vendorIds.current[i]) void deleteMasterData("vendors", vendorIds.current[i]).catch(() => toast.error("Could not delete parivar")); }, []);
 
-  const addAccount = useCallback((v: string) => { if (!accounts.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("accounts", v); }, [accounts]);
-  const editAccount = useCallback((i: number, v: string) => { if (accountIds.current[i]) void editMasterData("accounts", accountIds.current[i], v); }, []);
-  const deleteAccount = useCallback((i: number) => { if (accountIds.current[i]) void deleteMasterData("accounts", accountIds.current[i]); }, []);
+  const addAccount = useCallback((v: string) => { if (!accounts.some((item) => item.toLowerCase() === v.toLowerCase())) void addMasterData("accounts", v).catch(() => toast.error("Could not save account")); }, [accounts]);
+  const editAccount = useCallback((i: number, v: string) => { if (accountIds.current[i]) void editMasterData("accounts", accountIds.current[i], v).catch(() => toast.error("Could not update account")); }, []);
+  const deleteAccount = useCallback((i: number) => { if (accountIds.current[i]) void deleteMasterData("accounts", accountIds.current[i]).catch(() => toast.error("Could not delete account")); }, []);
 
-  const saveVouchers = useCallback((entries: VoucherEntry[]) => { if (ownerId && series) entries.forEach((entry) => void upsertVoucher(entry, ownerId, series)); }, [ownerId, series]);
+  const saveVouchers = useCallback((entries: VoucherEntry[]) => {
+    if (!ownerId || !series) { toast.error("Firebase sign-in is still starting. Please try again."); return; }
+    setHistory((current) => [...current, ...entries]);
+    void Promise.all(entries.map((entry) => upsertVoucher(entry, ownerId, series))).catch(() => {
+      setHistory((current) => current.filter((item) => !entries.some((entry) => entry.voucherNo === item.voucherNo)));
+      toast.error("Voucher was not saved. Check Firebase rules and try again.");
+    });
+  }, [ownerId, series]);
 
   const editVoucher = useCallback((id: number, patch: Partial<VoucherEntry>) => {
     const remoteTarget = history.find((entry) => entry.id === id);

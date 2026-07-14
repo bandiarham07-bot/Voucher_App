@@ -5,10 +5,10 @@ export interface MasterDataItem { id: string; name: string }
 
 function collectionRef(kind: "vendors" | "accounts") { return collection(db, kind); }
 
-export function subscribeMasterData(kind: "vendors" | "accounts", callback: (items: MasterDataItem[]) => void): Unsubscribe {
+export function subscribeMasterData(kind: "vendors" | "accounts", callback: (items: MasterDataItem[]) => void, onError?: (error: Error) => void): Unsubscribe {
   return onSnapshot(query(collectionRef(kind), orderBy("name")), (snapshot) => {
     callback(snapshot.docs.map((item) => ({ id: item.id, name: String(item.data().name ?? "") })));
-  });
+  }, onError);
 }
 
 export const addMasterData = (kind: "vendors" | "accounts", name: string) => addDoc(collectionRef(kind), { name, createdAt: serverTimestamp() });
