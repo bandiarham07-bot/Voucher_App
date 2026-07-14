@@ -1118,7 +1118,7 @@ export default function App() {
       </div>
     );
   }
-  if (!series) return <SeriesSetup ownerId={ownerId} onComplete={setSeries} />;
+  if (!series) return <SeriesSetup onComplete={setSeries} />;
 
   return (
     <div className="flex flex-col h-full bg-background max-w-md mx-auto relative overflow-hidden">

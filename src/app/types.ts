@@ -21,6 +21,8 @@ export interface VoucherEntry {
   voucherNo: string;
   /** Firebase anonymous-auth UID that owns this receipt. */
   ownerId?: string;
+  /** Internal Firestore document ID. Kept separate so multiple users may use the same series/number. */
+  firestoreId?: string;
   /** Device series, used to keep voucher numbers collision-free. */
   series?: string;
   splitGroup?: { index: number; total: number; groupId?: number };
