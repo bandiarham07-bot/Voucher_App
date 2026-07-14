@@ -1,12 +1,11 @@
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
-import type { VoucherEntry } from "../app/types";
 import { DEFAULT_SPLIT_THRESHOLD } from "../app/types";
 
 const DB_NAME = "voucher-receipt-app";
 const DB_VERSION = 1;
 const STORE = "kv";
 
-const LS_KEYS = ["vendors", "accounts", "vouchers", "splitThreshold"] as const;
+const LS_KEYS = ["splitThreshold"] as const;
 
 interface VoucherDB extends DBSchema {
   kv: {
@@ -69,20 +68,10 @@ export async function migrateFromLocalStorage(): Promise<void> {
   await tx.done;
 }
 
-export async function initAppData(): Promise<{
-  vendors: string[];
-  accounts: string[];
-  vouchers: VoucherEntry[];
-  splitThreshold: number;
-}> {
+export async function initAppData(): Promise<{ splitThreshold: number }> {
   await migrateFromLocalStorage();
 
-  const [vendors, accounts, vouchers, splitThreshold] = await Promise.all([
-    getItem<string[]>("vendors", ["Sharma Traders", "Mehta Supplies", "National Books"]),
-    getItem<string[]>("accounts", ["General Fund", "Education Fund", "Medical Aid"]),
-    getItem<VoucherEntry[]>("vouchers", []),
-    getItem<number>("splitThreshold", DEFAULT_SPLIT_THRESHOLD),
-  ]);
+  const splitThreshold = await getItem<number>("splitThreshold", DEFAULT_SPLIT_THRESHOLD);
 
-  return { vendors, accounts, vouchers, splitThreshold };
+  return { splitThreshold };
 }

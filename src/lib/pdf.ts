@@ -151,7 +151,7 @@ function buildVoucherHTML(entry: VoucherPDFEntry): string {
       <div style="height:6px;background:linear-gradient(to right,#1a2e5a,#c8902a,#1a2e5a);"></div>
       <div style="padding:20px 32px 28px;">
         <div style="text-align:center;margin-bottom:12px;">
-          <p style="font-size:11px;letter-spacing:3px;margin:0 0 4px;color:#1a2e5a;">${TRUST_DATA.mangalacharana}</p>
+          <p style="font-size:11px;margin:0 0 4px;color:#1a2e5a;">${TRUST_DATA.mangalacharana}</p>
           <h1 style="font-size:22px;font-weight:700;line-height:1.25;margin:0;color:#1a2e5a;">${TRUST_DATA.trustName}</h1>
           <p style="font-size:12px;color:rgba(26,46,90,0.8);margin:4px 0 0;">${TRUST_DATA.office}</p>
         </div>
@@ -159,7 +159,7 @@ function buildVoucherHTML(entry: VoucherPDFEntry): string {
         <div style="border-top:1px solid rgba(26,46,90,0.4);margin-bottom:16px;"></div>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
           <div><span style="font-size:12px;color:rgba(26,46,90,0.7);">${HINDI.serial}</span> <span style="font-size:15px;font-weight:700;letter-spacing:1px;">${escapeHTML(entry.voucherNo)}</span></div>
-          <div style="border:2px solid #1a2e5a;padding:4px 24px;border-radius:2px;"><span style="font-size:16px;font-weight:700;letter-spacing:3px;">${HINDI.receipt}</span></div>
+          <div style="border:2px solid #1a2e5a;padding:4px 24px;border-radius:2px;"><span style="font-size:16px;font-weight:700;">${HINDI.receipt}</span></div>
           <div><span style="font-size:12px;color:rgba(26,46,90,0.7);">${HINDI.date}</span> <span style="font-size:13px;font-weight:600;">${formatDisplayDate(entry.date)}</span></div>
         </div>
         <div style="display:flex;gap:16px;margin-bottom:20px;">
@@ -168,8 +168,8 @@ function buildVoucherHTML(entry: VoucherPDFEntry): string {
         </div>
         <div style="border:1px solid #1a2e5a;border-radius:2px;overflow:hidden;margin-bottom:16px;">
           <div style="display:grid;grid-template-columns:1fr 160px;background:#1a2e5a;">
-            <div style="padding:6px 16px;text-align:center;"><span style="font-size:12px;font-weight:600;color:white;letter-spacing:0.5px;">${HINDI.details}</span></div>
-            <div style="padding:6px 16px;text-align:center;border-left:1px solid rgba(255,255,255,0.3);"><span style="font-size:12px;font-weight:600;color:white;letter-spacing:0.5px;">${HINDI.amount}</span></div>
+            <div style="padding:6px 16px;text-align:center;"><span style="font-size:12px;font-weight:600;color:white;">${HINDI.details}</span></div>
+            <div style="padding:6px 16px;text-align:center;border-left:1px solid rgba(255,255,255,0.3);"><span style="font-size:12px;font-weight:600;color:white;">${HINDI.amount}</span></div>
           </div>
           ${rowsHTML}
           <div style="display:grid;grid-template-columns:1fr 160px;border-top:1px solid rgba(26,46,90,0.3);background:#f7f4ef;">

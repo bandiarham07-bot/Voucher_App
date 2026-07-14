@@ -19,6 +19,10 @@ export interface VoucherEntry {
   bankName?: string;
   date: string;
   voucherNo: string;
+  /** Firebase anonymous-auth UID that owns this receipt. */
+  ownerId?: string;
+  /** Device series, used to keep voucher numbers collision-free. */
+  series?: string;
   splitGroup?: { index: number; total: number; groupId?: number };
 }
 
