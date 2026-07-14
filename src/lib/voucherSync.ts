@@ -8,7 +8,7 @@ import { db } from "./firebase";
 const vouchers = collection(db, "vouchers");
 
 function toVoucher(id: string, data: Record<string, unknown>): VoucherEntry {
-  return { ...(data as VoucherEntry), id: typeof data.id === "number" ? data.id : Date.now(), voucherNo: String(data.voucherNo ?? id) };
+  return { ...(data as VoucherEntry), firestoreId: id, id: typeof data.id === "number" ? data.id : Date.now(), voucherNo: String(data.voucherNo ?? id) };
 }
 
 export function subscribeOwnVouchers(ownerId: string, callback: (entries: VoucherEntry[]) => void, onError?: (error: Error) => void): Unsubscribe {
@@ -22,7 +22,8 @@ export function subscribeAllVouchers(callback: (entries: VoucherEntry[]) => void
 }
 
 export async function upsertVoucher(entry: VoucherEntry, ownerId: string, series: string): Promise<void> {
-  await setDoc(doc(vouchers, entry.voucherNo), {
+  const firestoreId = entry.firestoreId ?? `${ownerId}_${entry.voucherNo}`;
+  await setDoc(doc(vouchers, firestoreId), {
     ...entry,
     ownerId,
     series,
@@ -31,4 +32,4 @@ export async function upsertVoucher(entry: VoucherEntry, ownerId: string, series
   }, { merge: true });
 }
 
-export const deleteVoucher = (entry: VoucherEntry) => deleteDoc(doc(vouchers, entry.voucherNo));
+export const deleteVoucher = (entry: VoucherEntry) => deleteDoc(doc(vouchers, entry.firestoreId ?? `${entry.ownerId}_${entry.voucherNo}`));
